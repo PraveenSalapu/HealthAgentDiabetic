@@ -32,6 +32,7 @@ import google.generativeai as genai
 from typing import Dict, List, Tuple, Optional
 import joblib
 import sklearn
+from xgboost import XGBClassifier
 
 # Suppress sklearn version warnings for better UX
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
@@ -42,23 +43,13 @@ warnings.filterwarnings('ignore', message='.*InconsistentVersionWarning.*')
 # ============================================================================
 
 # Model paths (adjust as needed)
-MODEL_PATH = "model_output/ml_xgboost_smoteenn_pipeline.pkl"
-THRESHOLD_PATH = "model_output/optimal_threshold.json"
-AVERAGES_PATH = "model_output/diabetic_averages.json"
+# MODEL_PATH = "model_output/ml_xgboost_smoteenn_pipeline.pkl"
 
-# PREPROCESSING NOTES:
-# ====================
-# Your model is an imblearn Pipeline with:
-#   1. ColumnTransformer (scales numeric: BMI, GenHlth, PhysHlth, Age, Education, Income)
-#   2. SMOTEENN sampler (only active during training, skipped during prediction)
-#   3. XGBoost classifier
-#
-# The app passes RAW user input → Pipeline handles scaling automatically.
-# Feature order MUST match training: GenHlth, HighBP, DiffWalk, BMI, HighChol,
-#                                     Age, HeartDiseaseorAttack, PhysHlth, Income,
-#                                     Education, PhysActivity
+MODEL_JSON_PATH = "model_output2/xgboost_model.json"
+PREPROCESSOR_PATH = "model_output2/preprocessor.pkl"
+THRESHOLD_PATH = "model_output2/optimal_threshold.json"
+AVERAGES_PATH = "model_output2/diabetic_averages.json"
 
-# Feature definitions - MUST MATCH TRAINING ORDER
 FEATURE_CONFIGS = {
     "GenHlth": {"type": "select", "options": [1, 2, 3, 4, 5], 
                 "labels": ["Excellent", "Very Good", "Good", "Fair", "Poor"]},
@@ -125,6 +116,17 @@ FORM_SECTIONS = [
     },
 ]
 
+RADAR_FEATURES = ["GenHlth", "BMI", "PhysHlth", "PhysActivity", "HighBP", "HighChol"]
+
+IDEAL_PROFILE = {
+    "GenHlth": 1,
+    "BMI": 22.0,
+    "PhysHlth": 0,
+    "PhysActivity": 1,
+    "HighBP": 0,
+    "HighChol": 0,
+}
+
 # Default averages (fallback if file not found or missing features)
 # Based on BRFSS 2015 diabetic population averages
 DEFAULT_DIABETIC_AVERAGES = {
@@ -145,73 +147,120 @@ DEFAULT_DIABETIC_AVERAGES = {
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def load_model(model_path: str):
-    """Load the trained model from disk with version compatibility checks."""
+# def load_model(model_path: str):
+#     """Load the trained model from disk with version compatibility checks."""
+#     try:
+#         # Suppress sklearn warnings during loading
+#         with warnings.catch_warnings():
+#             warnings.simplefilter("ignore")
+#             # Try joblib first, then pickle
+#             try:
+#                 model = joblib.load(model_path)
+#             except:
+#                 import pickle
+#                 with open(model_path, 'rb') as f:
+#                     model = pickle.load(f)
+        
+#         # Check if it's a dict or other container
+#         if isinstance(model, dict):
+#             # Try to find the pipeline in the dict
+#             if 'pipeline' in model:
+#                 model = model['pipeline']
+#             elif 'model' in model:
+#                 model = model['model']
+#             else:
+#                 st.error("❌ Could not find pipeline in dictionary")
+#                 return None
+        
+#         # Check model type
+#         from sklearn.pipeline import Pipeline
+#         try:
+#             from imblearn.pipeline import Pipeline as ImbPipeline
+#             is_imblearn_pipeline = isinstance(model, ImbPipeline)
+#         except:
+#             is_imblearn_pipeline = False
+        
+#         is_sklearn_pipeline = isinstance(model, Pipeline)
+#         is_pipeline = is_sklearn_pipeline or is_imblearn_pipeline
+        
+#         # Verify it has predict method
+#         if not hasattr(model, 'predict'):
+#             st.error(f"❌ Loaded object is {type(model)} but has no 'predict' method")
+#             st.error("This might not be a trained model. Check how the model was saved.")
+#             return None
+        
+#         # Verify model can make predictions
+#         try:
+#             # Test prediction with dummy data in CORRECT ORDER
+#             test_features = list(FEATURE_CONFIGS.keys())
+#             test_data = pd.DataFrame([{f: 0 if FEATURE_CONFIGS[f]["type"] == "select" 
+#                                        else FEATURE_CONFIGS[f]["default"] 
+#                                        for f in test_features}])
+            
+#             _ = model.predict(test_data)
+            
+#             return model
+#         except Exception as pred_error:
+#             st.error(f"⚠️ Model loaded but prediction test failed: {pred_error}")
+#             st.error(f"Error type: {type(pred_error).__name__}")
+#             import traceback
+#             st.code(traceback.format_exc())
+#             st.warning("The model may be incompatible with the current scikit-learn version or feature order is wrong.")
+#             return None
+            
+#     except Exception as e:
+#         st.error(f"❌ Error loading model from {model_path}: {e}")
+#         st.info("💡 Tip: Ensure the model file exists and was created with a compatible scikit-learn version.")
+#         import traceback
+#         st.code(traceback.format_exc())
+#         return None
+
+# NEW FUNCTION: Load model components separately
+def load_model_components(model_json_path: str, preprocessor_path: str, threshold_path: str):
+    """
+    Load XGBoost model (JSON), preprocessor (pkl), and optimal threshold.
+    
+    Returns:
+        tuple: (xgb_model, preprocessor, threshold) or (None, None, None) on error
+    """
     try:
-        # Suppress sklearn warnings during loading
+        # 1. Load preprocessor
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # Try joblib first, then pickle
-            try:
-                model = joblib.load(model_path)
-            except:
-                import pickle
-                with open(model_path, 'rb') as f:
-                    model = pickle.load(f)
+            preprocessor = joblib.load(preprocessor_path)
         
-        # Check if it's a dict or other container
-        if isinstance(model, dict):
-            # Try to find the pipeline in the dict
-            if 'pipeline' in model:
-                model = model['pipeline']
-            elif 'model' in model:
-                model = model['model']
-            else:
-                st.error("❌ Could not find pipeline in dictionary")
-                return None
+        # 2. Load XGBoost model from JSON
+        xgb_model = XGBClassifier()
+        xgb_model.load_model(model_json_path)
         
-        # Check model type
-        from sklearn.pipeline import Pipeline
-        try:
-            from imblearn.pipeline import Pipeline as ImbPipeline
-            is_imblearn_pipeline = isinstance(model, ImbPipeline)
-        except:
-            is_imblearn_pipeline = False
+        # 3. Load optimal threshold
+        with open(threshold_path, 'r') as f:
+            threshold_data = json.load(f)
+            threshold = threshold_data.get("threshold", 0.5)
         
-        is_sklearn_pipeline = isinstance(model, Pipeline)
-        is_pipeline = is_sklearn_pipeline or is_imblearn_pipeline
+        # 4. Test prediction with dummy data
+        test_features = list(FEATURE_CONFIGS.keys())
+        test_data = pd.DataFrame([{f: 0 if FEATURE_CONFIGS[f]["type"] == "select" 
+                                   else FEATURE_CONFIGS[f]["default"] 
+                                   for f in test_features}])
         
-        # Verify it has predict method
-        if not hasattr(model, 'predict'):
-            st.error(f"❌ Loaded object is {type(model)} but has no 'predict' method")
-            st.error("This might not be a trained model. Check how the model was saved.")
-            return None
+        # Preprocess and predict
+        X_processed = preprocessor.transform(test_data)
+        _ = xgb_model.predict_proba(X_processed)
         
-        # Verify model can make predictions
-        try:
-            # Test prediction with dummy data in CORRECT ORDER
-            test_features = list(FEATURE_CONFIGS.keys())
-            test_data = pd.DataFrame([{f: 0 if FEATURE_CONFIGS[f]["type"] == "select" 
-                                       else FEATURE_CONFIGS[f]["default"] 
-                                       for f in test_features}])
-            
-            _ = model.predict(test_data)
-            
-            return model
-        except Exception as pred_error:
-            st.error(f"⚠️ Model loaded but prediction test failed: {pred_error}")
-            st.error(f"Error type: {type(pred_error).__name__}")
-            import traceback
-            st.code(traceback.format_exc())
-            st.warning("The model may be incompatible with the current scikit-learn version or feature order is wrong.")
-            return None
-            
+        st.success("✅ Model components loaded successfully!")
+        return xgb_model, preprocessor, threshold
+        
+    except FileNotFoundError as e:
+        st.error(f"❌ File not found: {e}")
+        st.info("💡 Ensure all model files exist in the correct location.")
+        return None, None, None
+    
     except Exception as e:
-        st.error(f"❌ Error loading model from {model_path}: {e}")
-        st.info("💡 Tip: Ensure the model file exists and was created with a compatible scikit-learn version.")
+        st.error(f"❌ Error loading model components: {e}")
         import traceback
         st.code(traceback.format_exc())
-        return None
+        return None, None, None
 
 def load_diabetic_averages(averages_path: str) -> Dict[str, float]:
     """Load average feature values for diabetic population."""
@@ -334,12 +383,12 @@ def create_comparison_chart(user_data: Dict[str, float],
         x=features,
         y=user_values,
         marker=dict(
-            color='#2563eb',
-            line=dict(color='#1d4ed8', width=1.2)
+            color='#2563EB',
+            line=dict(color='#1E3A8A', width=1.2)
         ),
         text=[f'{v:.1f}' for v in user_values],
         textposition='outside',
-        textfont=dict(color='#0f172a', size=13, family='"Inter","Segoe UI",sans-serif')
+        textfont=dict(color='#e2e8f0', size=13, family='"Inter","Segoe UI",sans-serif')
     ))
     
     # Average diabetic values
@@ -348,12 +397,12 @@ def create_comparison_chart(user_data: Dict[str, float],
         x=features,
         y=avg_values,
         marker=dict(
-            color='#f97316',
-            line=dict(color='#ea580c', width=1.2)
+            color='#A855F7',
+            line=dict(color='#6D28D9', width=1.2)
         ),
         text=[f'{v:.1f}' for v in avg_values],
         textposition='outside',
-        textfont=dict(color='#0f172a', size=13, family='"Inter","Segoe UI",sans-serif')
+        textfont=dict(color='#e2e8f0', size=13, family='"Inter","Segoe UI",sans-serif')
     ))
     
     fig.update_layout(
@@ -370,33 +419,33 @@ def create_comparison_chart(user_data: Dict[str, float],
             y=1.02,
             xanchor="right",
             x=1,
-            bgcolor='rgba(255,255,255,0.9)',
-            bordercolor='#dbeafe',
+            bgcolor='rgba(11,17,32,0.85)',
+            bordercolor='#1f2a4d',
             borderwidth=1
         ),
         uniformtext=dict(mode="show", minsize=12),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#0f172a', family='"Inter","Segoe UI",sans-serif'),
+        paper_bgcolor='#0b1120',
+        plot_bgcolor='#111c3a',
+        font=dict(color='#e2e8f0', family='"Inter","Segoe UI",sans-serif'),
         margin=dict(l=40, r=40, t=80, b=40)
     )
     
     fig.update_xaxes(
         tickangle=-35,
         showgrid=False,
-        linecolor='#cbd5f5',
-        tickfont=dict(color='#0f172a', size=12, family='"Inter","Segoe UI",sans-serif')
+        linecolor='#1f2a4d',
+        tickfont=dict(color='#cbd5f5', size=12, family='"Inter","Segoe UI",sans-serif')
     )
     fig.update_yaxes(
-        gridcolor='#e2e8f0',
-        zerolinecolor="#cbd5f5",
-        tickfont=dict(color='#0f172a', size=12, family='"Inter","Segoe UI",sans-serif')
+        gridcolor='#1f2a4d',
+        zerolinecolor='#1f2a4d',
+        tickfont=dict(color='#cbd5f5', size=12, family='"Inter","Segoe UI",sans-serif')
     )
-
+    
     return fig, differences
 
 def classify_risk(probability: float) -> Tuple[str, str, str]:
-    """Translate probability into a labeled risk tier, CSS badge class, and guidance."""
+    """Map probability to risk tier, CSS badge class, and guidance message."""
     if probability < 30:
         return (
             "Low",
@@ -415,6 +464,7 @@ def classify_risk(probability: float) -> Tuple[str, str, str]:
         "Your risk signals are elevated. Schedule time with a healthcare professional to plan next steps.",
     )
 
+
 def create_risk_gauge(probability: float) -> go.Figure:
     """Create risk level gauge chart."""
     fig = go.Figure(go.Indicator(
@@ -423,27 +473,27 @@ def create_risk_gauge(probability: float) -> go.Figure:
         domain={'x': [0, 1], 'y': [0, 1]},
         title={
             'text': "Diabetes Risk Probability",
-            'font': {'size': 24, 'color': '#0f172a', 'family': '"Inter","Segoe UI",sans-serif'}
+            'font': {'size': 24, 'color': '#f8fafc', 'family': '"Inter","Segoe UI",sans-serif'}
         },
-        number={'suffix': "%", 'font': {'size': 48, 'color': '#0f172a', 'family': '"Inter","Segoe UI",sans-serif'}},
+        number={'suffix': "%", 'font': {'size': 48, 'color': '#f8fafc', 'family': '"Inter","Segoe UI",sans-serif'}},
         gauge={
             'axis': {
                 'range': [None, 100],
                 'tickwidth': 1,
-                'tickcolor': "#0f172a",
-                'tickfont': {'color': '#0f172a', 'family': '"Inter","Segoe UI",sans-serif'}
+                'tickcolor': "#1e293b",
+                'tickfont': {'color': '#cbd5f5', 'family': '"Inter","Segoe UI",sans-serif'}
             },
-            'bar': {'color': "#2563EB"},
-            'bgcolor': "#ffffff",
+            'bar': {'color': "#38bdf8"},
+            'bgcolor': "#111c3a",
             'borderwidth': 2,
-            'bordercolor': "#dbeafe",
+            'bordercolor': "#1f2a4d",
             'steps': [
-                {'range': [0, 30], 'color': '#bfdbfe'},
-                {'range': [30, 60], 'color': '#fde68a'},
-                {'range': [60, 100], 'color': '#fecaca'}
+                {'range': [0, 30], 'color': '#134e4a'},
+                {'range': [30, 60], 'color': '#78350f'},
+                {'range': [60, 100], 'color': '#7f1d1d'}
             ],
             'threshold': {
-                'line': {'color': "#dc2626", 'width': 4},
+                'line': {'color': "#f97316", 'width': 4},
                 'thickness': 0.75,
                 'value': probability
             }
@@ -453,8 +503,173 @@ def create_risk_gauge(probability: float) -> go.Figure:
     fig.update_layout(
         height=300,
         margin=dict(l=20, r=20, t=60, b=20),
-        paper_bgcolor='#f1f5f9'
+        paper_bgcolor='#0b1120'
     )
+    return fig
+
+
+def prepare_feature_contributions(user_data: Dict[str, float],
+                                  avg_data: Dict[str, float]) -> List[Tuple[str, float]]:
+    """Compute normalized deltas for each feature to feed the waterfall chart."""
+    contributions: List[Tuple[str, float]] = []
+
+    for feature, config in FEATURE_CONFIGS.items():
+        user_value = float(user_data.get(feature, avg_data.get(feature, 0)))
+        avg_value = float(avg_data.get(feature, DEFAULT_DIABETIC_AVERAGES.get(feature, user_value)))
+
+        if config["type"] == "number":
+            span = float(config["max"] - config["min"])
+            if span == 0:
+                continue
+            delta = (user_value - avg_value) / span * 100
+        else:
+            delta = (user_value - avg_value) * 100
+
+        contributions.append((feature, delta))
+
+    contributions.sort(key=lambda item: abs(item[1]), reverse=True)
+    return contributions
+
+
+def create_contribution_waterfall(user_data: Dict[str, float],
+                                  avg_data: Dict[str, float]) -> go.Figure:
+    """Build a waterfall chart showing how each factor shifts risk relative to diabetic average."""
+    contributions = prepare_feature_contributions(user_data, avg_data)[:8]
+    labels = [FEATURE_NAMES[f] for f, _ in contributions]
+    deltas = [round(delta, 2) for _, delta in contributions]
+
+    fig = go.Figure(
+        go.Waterfall(
+            orientation="h",
+            measure=["relative"] * len(deltas),
+            y=labels,
+            x=deltas,
+            connector={"mode": "spanning", "line": {"color": "#1f2a4d", "width": 1}},
+            decreasing={"marker": {"color": "#f87171"}},
+            increasing={"marker": {"color": "#38bdf8"}},
+        )
+    )
+
+    fig.update_layout(
+        title="Feature shifts versus diabetic average (normalized)",
+        showlegend=False,
+        height=420,
+        margin=dict(l=120, r=30, t=60, b=40),
+        paper_bgcolor="#0b1120",
+        plot_bgcolor="#111c3a",
+        font=dict(color="#e2e8f0", family='"Inter","Segoe UI",sans-serif'),
+        xaxis=dict(
+            title="Relative shift (percentage points)",
+            gridcolor="#1f2a4d",
+            zerolinecolor="#1f2a4d",
+            tickfont=dict(color="#cbd5f5"),
+        ),
+        yaxis=dict(tickfont=dict(color="#cbd5f5")),
+    )
+
+    return fig
+
+
+def score_feature_for_radar(value: float, feature: str) -> float:
+    """Translate raw feature values into a 0-1 wellness score (1 = favorable)."""
+    config = FEATURE_CONFIGS[feature]
+
+    if feature == "GenHlth":
+        min_val, max_val = 1, 5
+        return max(0.0, min(1.0, 1 - (value - min_val) / (max_val - min_val)))
+
+    if feature == "BMI":
+        # Ideal BMI approximated at 22 within allowable range.
+        ideal = 22.0
+        spread = max(config["max"] - config["min"], 1)
+        return max(0.0, min(1.0, 1 - abs(value - ideal) / (spread / 2)))
+
+    if feature == "PhysHlth":
+        return max(0.0, min(1.0, 1 - value / max(config["max"], 1)))
+
+    if feature == "PhysActivity":
+        return 1.0 if value >= 1 else 0.0
+
+    if feature in {"HighBP", "HighChol"}:
+        return 1.0 - min(1.0, max(0.0, value))
+
+    return 0.5
+
+
+def create_wellness_radar(user_data: Dict[str, float],
+                          avg_data: Dict[str, float]) -> go.Figure:
+    """Create a radar chart comparing the user to archetypes."""
+    categories = [FEATURE_NAMES[f] for f in RADAR_FEATURES]
+
+    user_scores = [
+        score_feature_for_radar(float(user_data.get(f, avg_data.get(f, IDEAL_PROFILE.get(f, 0)))), f)
+        for f in RADAR_FEATURES
+    ]
+
+    ideal_scores = [
+        score_feature_for_radar(float(IDEAL_PROFILE.get(f, avg_data.get(f, 0))), f)
+        for f in RADAR_FEATURES
+    ]
+
+    diabetic_scores = [
+        score_feature_for_radar(float(avg_data.get(f, IDEAL_PROFILE.get(f, 0))), f)
+        for f in RADAR_FEATURES
+    ]
+
+    # Close the loop for polar plot
+    categories_closed = categories + [categories[0]]
+    traces = {
+        "Your profile": user_scores + [user_scores[0]],
+        "Ideal baseline": ideal_scores + [ideal_scores[0]],
+        "Diabetic average": diabetic_scores + [diabetic_scores[0]],
+    }
+
+    fig = go.Figure()
+    palette = {
+        "Your profile": "#38bdf8",
+        "Ideal baseline": "#22d3ee",
+        "Diabetic average": "#f97316",
+    }
+
+    for label, values in traces.items():
+        fig.add_trace(
+            go.Scatterpolar(
+                r=values,
+                theta=categories_closed,
+                fill="toself",
+                name=label,
+                line=dict(color=palette[label], width=2),
+                opacity=0.5 if label != "Your profile" else 0.7,
+            )
+        )
+
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                range=[0, 1],
+                showticklabels=True,
+                ticks="",
+                tickfont=dict(size=10, color="#cbd5f5"),
+                gridcolor="#1f2a4d",
+                linecolor="#1f2a4d",
+            ),
+            bgcolor="#111c3a",
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.05,
+            xanchor="center",
+            x=0.5,
+            font=dict(color="#cbd5f5"),
+        ),
+        margin=dict(l=40, r=40, t=60, b=40),
+        paper_bgcolor="#0b1120",
+        title="Wellness balance across key factors",
+        font=dict(color="#e2e8f0", family='"Inter","Segoe UI",sans-serif'),
+        height=420,
+    )
+
     return fig
 
 def generate_insights(user_data: Dict[str, float], 
@@ -520,6 +735,57 @@ def send_message_to_gemini(model, chat_history: List[Dict[str, str]],
     except Exception as e:
         return f"I apologize, but I encountered an error: {str(e)}. Please try again or rephrase your question."
 
+
+def generate_fallback_response(probability: float,
+                               user_data: Dict[str, float],
+                               user_message: Optional[str] = None) -> str:
+    """Provide an on-device assistant response when Gemini is unavailable."""
+    risk_level, _, risk_message = classify_risk(probability)
+    summary = (
+        f"The assessment estimates a {probability:.1f}% likelihood of diabetes, "
+        f"which places you in the {risk_level.lower()} risk range. {risk_message}"
+    )
+
+    lifestyle_hints: List[str] = []
+    bmi = user_data.get("BMI")
+    if bmi is not None and bmi >= 30:
+        lifestyle_hints.append(
+            "Set a realistic weekly movement goal and focus on gradual weight management."
+        )
+    if user_data.get("PhysActivity") == 0:
+        lifestyle_hints.append(
+            "Incorporate at least 150 minutes of moderate activity per week, even if you start with 10-minute walks."
+        )
+    if user_data.get("HighBP") == 1:
+        lifestyle_hints.append(
+            "Monitor blood pressure regularly and discuss medication adherence with your clinician."
+        )
+    if user_data.get("HighChol") == 1:
+        lifestyle_hints.append(
+            "Review cholesterol numbers with your care team and ask whether dietary adjustments could help."
+        )
+
+    if not lifestyle_hints:
+        lifestyle_hints.append(
+            "Keep reinforcing balanced nutrition, regular movement, quality sleep, and stress reduction."
+        )
+
+    action_plan = "Here are next steps to consider:\n- " + "\n- ".join(lifestyle_hints[:3])
+
+    if user_message:
+        return (
+            f"You asked: \"{user_message}\".\n\n"
+            f"{summary}\n\n"
+            f"{action_plan}\n\n"
+            "Always review these ideas with a healthcare professional who knows your full history."
+        )
+
+    return (
+        f"{summary}\n\n"
+        f"{action_plan}\n\n"
+        "Use the chat to dig deeper into lifestyle changes, lab tests, or questions for your next appointment."
+    )
+
 # ============================================================================
 # STREAMLIT APP
 # ============================================================================
@@ -538,6 +804,8 @@ def initialize_session_state():
         st.session_state.chatbot_initialized = False
     if 'system_prompt' not in st.session_state:
         st.session_state.system_prompt = ""
+    if 'optimal_threshold' not in st.session_state:
+        st.session_state.optimal_threshold = 0.5
 
 def reset_app():
     """Reset application state."""
@@ -547,6 +815,9 @@ def reset_app():
     st.session_state.chat_history = []
     st.session_state.chatbot_initialized = False
     st.session_state.system_prompt = ""
+    default_threshold = st.session_state.get("optimal_threshold_default", 0.5)
+    st.session_state.optimal_threshold = default_threshold
+
 
 def main():
     st.set_page_config(
@@ -559,77 +830,100 @@ def main():
         """
         <style>
         :root {
-            color-scheme: light;
+            color-scheme: dark;
         }
         body, .stApp {
-            background-color: #f5f7fb !important;
-            color: #0f172a !important;
+            background-color: #0b1120 !important;
+            color: #e2e8f0 !important;
             font-family: "Inter", "Segoe UI", sans-serif !important;
         }
         div[data-testid="stAppViewContainer"] {
-            background-color: #f5f7fb !important;
+            background-color: #0b1120 !important;
         }
         div[data-testid="stSidebar"] {
-            background-color: #eef2ff !important;
+            background-color: #111c3a !important;
         }
         .stApp h1, .stApp h2, .stApp h3, .stApp h4 {
-            color: #0f172a !important;
+            color: #f8fafc !important;
+        }
+        .stMarkdown, .stMarkdown p, .stMarkdown span, .stMarkdown li, .stMarkdown strong, .stMarkdown em {
+            color: #e2e8f0 !important;
         }
         button[kind="primary"] {
-            background: linear-gradient(135deg, #4f46e5, #2563eb) !important;
-            color: #f8fafc !important;
-            border: 1px solid #4338ca !important;
+            background: linear-gradient(135deg, #38bdf8, #2563eb) !important;
+            color: #0b1120 !important;
+            border: 1px solid #38bdf8 !important;
             border-radius: 14px !important;
             font-weight: 600 !important;
-            box-shadow: 0 16px 36px rgba(79, 70, 229, 0.25) !important;
+            box-shadow: 0 18px 38px rgba(37, 99, 235, 0.35) !important;
         }
         button[kind="primary"]:hover {
-            background: linear-gradient(135deg, #4338ca, #1d4ed8) !important;
+            background: linear-gradient(135deg, #1d4ed8, #1e40af) !important;
         }
         button[kind="secondary"] {
-            background: #ffffff !important;
-            color: #1d4ed8 !important;
-            border: 1px solid #c7d2fe !important;
+            background: transparent !important;
+            color: #60a5fa !important;
+            border: 1px solid #1d4ed8 !important;
             border-radius: 14px !important;
             font-weight: 600 !important;
         }
         button[kind="secondary"]:hover {
-            background: #e0e7ff !important;
+            background: rgba(37, 99, 235, 0.15) !important;
         }
         form[data-testid="stForm"] {
-            background: #ffffff !important;
-            border: 1px solid #e2e8f0 !important;
-            border-radius: 20px !important;
-            padding: 2rem 2.5rem !important;
-            box-shadow: 0 20px 45px rgba(15, 23, 42, 0.08) !important;
+            background: #111c3a !important;
+            border: 1px solid #1f2a4d !important;
+            border-radius: 22px !important;
+            padding: 2.2rem !important;
+            box-shadow: 0 28px 55px rgba(15, 23, 42, 0.5) !important;
         }
         form[data-testid="stForm"] label {
             font-weight: 600 !important;
-            color: #0f172a !important;
+            color: #e2e8f0 !important;
         }
         .form-section-header h3 {
             margin-bottom: 0.25rem;
-            color: #0f172a;
+            color: #f1f5f9;
         }
         .form-section-header p {
             margin-top: 0;
-            color: #475569;
+            color: #94a3b8;
         }
         .form-section-divider {
             border: 0;
             height: 1px;
-            background: linear-gradient(90deg, rgba(148, 163, 184, 0.2), rgba(148, 163, 184, 0));
+            background: linear-gradient(90deg, rgba(148, 163, 184, 0.1), rgba(148, 163, 184, 0));
+        }
+        .stApp input, .stApp textarea, div[data-baseweb="input"] input {
+            background-color: #0f172a !important;
+            color: #f8fafc !important;
+            border: 1px solid #334155 !important;
+            border-radius: 12px !important;
+        }
+        div[data-baseweb="select"] > div {
+            background-color: #0f172a !important;
+            color: #f8fafc !important;
+            border: 1px solid #334155 !important;
+            border-radius: 12px !important;
+        }
+        div[data-testid="stNumberInput"] input {
+            background-color: #0f172a !important;
+            color: #f8fafc !important;
+        }
+        div[data-testid="stNumberInput"] button {
+            background-color: #1e293b !important;
+            color: #cbd5f5 !important;
         }
         .app-hero {
             display: grid;
             grid-template-columns: minmax(0, 2.4fr) minmax(0, 1fr);
-            gap: 2.75rem;
-            padding: 2.75rem;
-            border-radius: 28px;
-            border: 1px solid #c7d2fe;
-            background: linear-gradient(135deg, #eef2ff, #dbeafe);
-            box-shadow: 0 28px 60px rgba(79, 70, 229, 0.22);
-            margin-bottom: 1.5rem;
+            gap: 2.5rem;
+            padding: 3rem;
+            border-radius: 30px;
+            border: 1px solid #1f2a4d;
+            background: linear-gradient(135deg, rgba(30, 27, 75, 0.95), rgba(15, 23, 42, 0.95));
+            box-shadow: 0 32px 70px rgba(15, 23, 42, 0.6);
+            margin-bottom: 1.75rem;
         }
         .hero-left h1 {
             margin-bottom: 0.75rem;
@@ -642,8 +936,8 @@ def main():
             gap: 0.4rem;
             padding: 0.35rem 0.9rem;
             border-radius: 999px;
-            background: rgba(255, 255, 255, 0.45);
-            color: #4338ca;
+            background: rgba(37, 214, 238, 0.15);
+            color: #38bdf8;
             font-weight: 600;
             font-size: 0.85rem;
             letter-spacing: 0.05em;
@@ -651,7 +945,7 @@ def main():
         }
         .hero-subtitle {
             font-size: 1.05rem;
-            color: #1e293b;
+            color: #cbd5f5;
             margin-top: 0.5rem;
             margin-bottom: 1.5rem;
         }
@@ -661,32 +955,32 @@ def main():
             gap: 0.75rem;
         }
         .hero-step {
-            background: rgba(255, 255, 255, 0.65);
-            color: #1d4ed8;
+            background: rgba(37, 99, 235, 0.18);
+            color: #93c5fd;
             font-weight: 600;
             border-radius: 12px;
             padding: 0.55rem 0.9rem;
         }
         .hero-highlight {
-            background: #ffffff;
-            border-radius: 22px;
-            border: 1px solid #e0e7ff;
+            background: #111c3a;
+            border-radius: 24px;
+            border: 1px solid #1f2a4d;
             padding: 2rem;
             display: flex;
             flex-direction: column;
             gap: 0.9rem;
-            box-shadow: 0 22px 45px rgba(15, 23, 42, 0.12);
+            box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.25);
         }
         .hero-metric-label {
             text-transform: uppercase;
             font-size: 0.75rem;
             letter-spacing: 0.12em;
-            color: #475569;
+            color: #94a3b8;
         }
         .hero-metric-value {
-            font-size: 3rem;
+            font-size: 3.1rem;
             font-weight: 700;
-            color: #1e293b;
+            color: #f8fafc;
         }
         .hero-metric-badge {
             display: inline-flex;
@@ -698,32 +992,32 @@ def main():
         }
         .hero-highlight-note {
             font-size: 0.92rem;
-            color: #475569;
+            color: #cbd5f5;
         }
         .risk-badge-low {
-            background: #dcfce7;
-            color: #15803d;
+            background: rgba(34, 197, 94, 0.2);
+            color: #4ade80;
         }
         .risk-badge-medium {
-            background: #fef9c3;
-            color: #b45309;
+            background: rgba(251, 191, 36, 0.25);
+            color: #facc15;
         }
         .risk-badge-high {
-            background: #fee2e2;
-            color: #b91c1c;
+            background: rgba(248, 113, 113, 0.25);
+            color: #f87171;
         }
         .risk-badge-neutral {
-            background: #e0f2fe;
-            color: #0c4a6e;
+            background: rgba(59, 130, 246, 0.25);
+            color: #60a5fa;
         }
         .status-card {
             display: flex;
             gap: 0.75rem;
-            background: #ffffff;
+            background: #111c3a;
             border-radius: 18px;
-            border: 1px solid #e2e8f0;
+            border: 1px solid #1f2a4d;
             padding: 1rem 1.2rem;
-            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+            box-shadow: 0 22px 46px rgba(15, 23, 42, 0.45);
             height: 100%;
         }
         .status-icon {
@@ -733,79 +1027,82 @@ def main():
             min-width: 2.5rem;
             padding: 0.3rem 0.65rem;
             border-radius: 999px;
-            background: #eef2ff;
-            color: #4338ca;
-            font-size: 0.85rem;
+            background: rgba(59, 130, 246, 0.2);
+            color: #38bdf8;
+            font-size: 0.9rem;
             font-weight: 700;
             letter-spacing: 0.08em;
         }
         .status-title {
             font-weight: 600;
-            color: #0f172a;
+            color: #f1f5f9;
         }
         .status-description {
             font-size: 0.9rem;
-            color: #475569;
+            color: #94a3b8;
             margin-top: 0.25rem;
         }
         .risk-summary-card {
             display: flex;
             justify-content: space-between;
             gap: 1.5rem;
-            background: #ffffff;
+            background: #111c3a;
             border-radius: 20px;
-            border: 1px solid #e0e7ff;
+            border: 1px solid #1f2a4d;
             padding: 1.75rem 2rem;
-            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+            box-shadow: 0 22px 46px rgba(15, 23, 42, 0.45);
             margin-bottom: 1.5rem;
         }
         .risk-summary-label {
             text-transform: uppercase;
             font-size: 0.8rem;
             letter-spacing: 0.12em;
-            color: #475569;
+            color: #94a3b8;
         }
         .risk-summary-value {
             font-size: 2.8rem;
             font-weight: 700;
-            color: #1e293b;
+            color: #f8fafc;
         }
         .insight-item {
-            background: #ffffff;
-            border: 1px solid #e2e8f0;
+            background: #111c3a;
+            border: 1px solid #1f2a4d;
             border-radius: 16px;
             padding: 1rem 1.25rem;
             margin-bottom: 0.75rem;
-            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
-            color: #0f172a;
+            box-shadow: 0 18px 38px rgba(15, 23, 42, 0.4);
+            color: #f1f5f9;
             font-weight: 500;
         }
         div[data-testid="stChatMessage"] {
-            background: linear-gradient(135deg, #f8fafc, #eef2ff) !important;
-            border: 1px solid #e0e7ff !important;
+            background: linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(30, 41, 59, 0.95)) !important;
+            border: 1px solid #1f2a4d !important;
             border-radius: 18px !important;
-            color: #0f172a !important;
-            box-shadow: 0 16px 35px rgba(15, 23, 42, 0.08) !important;
+            color: #e2e8f0 !important;
+            box-shadow: 0 18px 38px rgba(15, 23, 42, 0.45) !important;
+        }
+        div[data-testid="stChatMessage"] * {
+            color: #e2e8f0 !important;
         }
         div[data-testid="stChatInput"] textarea {
-            background: #ffffff !important;
-            color: #0f172a !important;
+            background: #111c3a !important;
+            color: #e2e8f0 !important;
             border-radius: 16px !important;
-            border: 1px solid #cbd5f5 !important;
-            box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08) !important;
+            border: 1px solid #1f2a4d !important;
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.5) !important;
         }
         div[data-testid="stChatInput"] button {
             background: linear-gradient(135deg, #38bdf8, #0ea5e9) !important;
-            color: #0f172a !important;
+            color: #0b1120 !important;
             border-radius: 12px !important;
         }
         .assistant-tip {
             margin-top: 1rem;
-            background: #f8fafc;
-            border: 1px dashed #cbd5f5;
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px dashed rgba(59, 130, 246, 0.6);
             border-radius: 14px;
             padding: 0.85rem 1.1rem;
-            color: #334155;
+            color: #cbd5f5;
         }
         .assistant-tip ul {
             margin: 0.35rem 0 0 1.1rem;
@@ -821,9 +1118,25 @@ def main():
     api_key = os.getenv("GEMINI_API_KEY")
     model_name = os.getenv("GEMINI_MODEL", "gemini-pro")
 
-    model = load_model(MODEL_PATH)
+    xgb_model, preprocessor, optimal_threshold = load_model_components(
+        MODEL_JSON_PATH,
+        PREPROCESSOR_PATH,
+        THRESHOLD_PATH,
+    )
+    if xgb_model is None or preprocessor is None:
+        st.error("Unable to load model components. Verify the paths and try again.")
+        st.stop()
+
     diabetic_averages = load_diabetic_averages(AVERAGES_PATH)
     gemini_model = initialize_gemini(api_key, model_name)
+
+    if "optimal_threshold_default" not in st.session_state:
+        st.session_state.optimal_threshold_default = optimal_threshold
+    if (
+        "optimal_threshold" not in st.session_state
+        or st.session_state.optimal_threshold == 0.5
+    ):
+        st.session_state.optimal_threshold = optimal_threshold
 
     prediction_made = st.session_state.prediction_made
     probability = st.session_state.prediction_prob
@@ -897,11 +1210,9 @@ def main():
             on_click=reset_app,
         )
 
-    assessment_tab, insights_tab, assistant_tab = st.tabs(
-        ["Assessment", "Insights", "AI Assistant"]
-    )
+    st.markdown("")
 
-    with assessment_tab:
+    if not prediction_made:
         st.subheader("Tell us about yourself")
         st.caption("Complete the sections below. Defaults reflect typical values and can be adjusted.")
 
@@ -937,7 +1248,11 @@ def main():
                             options = config["options"]
                             labels = config["labels"]
                             default_value = config.get("default", options[0])
-                            default_index = options.index(default_value)
+                            default_index = (
+                                options.index(default_value)
+                                if default_value in options
+                                else 0
+                            )
                             label_lookup = dict(zip(options, labels))
                             selected_value = st.selectbox(
                                 label,
@@ -957,36 +1272,54 @@ def main():
             submitted = st.form_submit_button("Analyze my risk", use_container_width=True)
 
             if submitted:
-                if model is None:
-                    st.error("Model could not be loaded. Verify the model path and try again.")
-                else:
-                    clean_data = {k: sanitize_input(v, k) for k, v in user_inputs.items()}
-                    feature_order = list(FEATURE_CONFIGS.keys())
-                    input_df = pd.DataFrame([clean_data])[feature_order]
+                clean_data = {k: sanitize_input(v, k) for k, v in user_inputs.items()}
+                feature_order = list(FEATURE_CONFIGS.keys())
+                input_df = pd.DataFrame([clean_data])[feature_order]
 
-                    with st.expander("Model input preview", expanded=False):
-                        st.dataframe(input_df)
+                with st.expander("Model input preview", expanded=False):
+                    st.dataframe(input_df)
 
-                    try:
-                        probability = float(model.predict_proba(input_df)[0][1] * 100)
-                        st.session_state.user_data = clean_data
-                        st.session_state.prediction_prob = probability
-                        st.session_state.prediction_made = True
-                        st.session_state.system_prompt = get_system_prompt(probability, clean_data)
-                        st.session_state.chat_history = []
-                        st.session_state.chatbot_initialized = False
-                        st.rerun()
-                    except Exception as error:
-                        st.error(f"Prediction failed: {error}")
-                        st.info("Check that the model expects these features and is accessible from disk.")
+                try:
+                    X_processed = preprocessor.transform(input_df)
+                    prediction_proba = xgb_model.predict_proba(X_processed)[0]
+                    probability = float(prediction_proba[1] * 100)
+                    threshold_value = st.session_state.get(
+                        "optimal_threshold",
+                        optimal_threshold,
+                    )
+                    prediction = 1 if probability >= threshold_value * 100 else 0
 
-    with insights_tab:
-        if not st.session_state.prediction_made:
-            st.info("Complete the assessment to unlock tailored risk insights and comparisons.")
-        else:
-            probability = st.session_state.prediction_prob
-            risk_level, badge_class, risk_message = classify_risk(probability)
+                    with st.expander("Model output preview", expanded=False):
+                        st.write(f"**Prediction:** {prediction}")
+                        st.write(f"**Probabilities:** {prediction_proba}")
+                        st.write(f"**Diabetes Probability:** {probability:.2f}%")
 
+                    st.session_state.user_data = clean_data
+                    st.session_state.prediction_prob = probability
+                    st.session_state.prediction_made = True
+                    st.session_state.system_prompt = get_system_prompt(probability, clean_data)
+                    st.session_state.chat_history = []
+                    st.session_state.chatbot_initialized = False
+                    st.session_state.optimal_threshold = threshold_value
+
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"Prediction failed: {error}")
+                    st.info("Ensure the preprocessor and model files are accessible and compatible.")
+    else:
+        probability = st.session_state.prediction_prob
+        risk_level, badge_class, risk_message = classify_risk(probability)
+
+        st.success("Assessment captured. Explore your personalized visuals and guided assistant below.")
+
+        with st.expander("Review your submitted profile", expanded=False):
+            summary_df = pd.DataFrame([st.session_state.user_data])
+            summary_df.rename(columns=FEATURE_NAMES, inplace=True)
+            st.dataframe(summary_df)
+
+        results_col, assistant_col = st.columns([7, 5], gap="large")
+
+        with results_col:
             st.subheader("Personalized risk summary")
             st.markdown(
                 """
@@ -1032,19 +1365,39 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-    with assistant_tab:
-        st.subheader("AI health assistant")
-        if not st.session_state.prediction_made:
-            st.info("Run the assessment first so the assistant can ground responses in your results.")
-        elif gemini_model is None:
-            st.warning("Add a GEMINI_API_KEY environment variable to enable the assistant.")
-        else:
-            if not st.session_state.chatbot_initialized:
-                initial_response = send_message_to_gemini(
-                    gemini_model,
-                    [],
-                    st.session_state.system_prompt,
+            st.markdown("### What drives your risk estimate")
+            waterfall_fig = create_contribution_waterfall(
+                st.session_state.user_data,
+                diabetic_averages,
+            )
+            st.plotly_chart(waterfall_fig, use_container_width=True)
+
+            st.markdown("### Wellness radar")
+            radar_fig = create_wellness_radar(
+                st.session_state.user_data,
+                diabetic_averages,
+            )
+            st.plotly_chart(radar_fig, use_container_width=True)
+
+        with assistant_col:
+            st.subheader("AI health assistant")
+            if gemini_model is None:
+                st.caption(
+                    "No Gemini API key detected. Responses are generated locally from the assessment summary."
                 )
+
+            if not st.session_state.chatbot_initialized:
+                if gemini_model is not None:
+                    initial_response = send_message_to_gemini(
+                        gemini_model,
+                        [],
+                        st.session_state.system_prompt,
+                    )
+                else:
+                    initial_response = generate_fallback_response(
+                        probability,
+                        st.session_state.user_data,
+                    )
                 st.session_state.chat_history.append(
                     {"role": "assistant", "content": initial_response}
                 )
@@ -1057,7 +1410,7 @@ def main():
                         with st.chat_message("user"):
                             st.markdown(message["content"])
                     else:
-                        with st.chat_message("assistant", avatar="AI"):
+                        with st.chat_message("assistant", avatar="\U0001F916"):
                             st.markdown(message["content"])
 
             st.markdown(
@@ -1079,10 +1432,17 @@ def main():
                 st.session_state.chat_history.append(
                     {"role": "user", "content": user_message}
                 )
-                with st.spinner("Composing guidance..."):
-                    assistant_response = send_message_to_gemini(
-                        gemini_model,
-                        st.session_state.chat_history[:-1],
+                if gemini_model is not None:
+                    with st.spinner("Composing guidance..."):
+                        assistant_response = send_message_to_gemini(
+                            gemini_model,
+                            st.session_state.chat_history[:-1],
+                            user_message,
+                        )
+                else:
+                    assistant_response = generate_fallback_response(
+                        probability,
+                        st.session_state.user_data,
                         user_message,
                     )
                 st.session_state.chat_history.append(
