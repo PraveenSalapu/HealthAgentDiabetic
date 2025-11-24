@@ -1,0 +1,44 @@
+{
+  "features": [
+    "GenHlth",
+    "HighBP",
+    "DiffWalk",
+    "BMI",
+    "HighChol",
+    "Age",
+    "HeartDiseaseorAttack",
+    "PhysHlth",
+    "Income",
+    "Education",
+    "PhysActivity"
+  ],
+  "feature_order": [
+    "GenHlth",
+    "HighBP",
+    "DiffWalk",
+    "BMI",
+    "HighChol",
+    "Age",
+    "HeartDiseaseorAttack",
+    "PhysHlth",
+    "Income",
+    "Education",
+    "PhysActivity"
+  ],
+  "numeric_features": [
+    "BMI",
+    "GenHlth",
+    "PhysHlth",
+    "Age",
+    "Education",
+    "Income"
+  ],
+  "binary_features": [
+    "HighBP",
+    "DiffWalk",
+    "HighChol",
+    "HeartDiseaseorAttack",
+    "PhysActivity"
+  ],
+  "target": "Diabetes_binary"
+}

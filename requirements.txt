@@ -1,0 +1,14 @@
+streamlit
+pandas
+numpy
+plotly
+google-generativeai
+joblib
+xgboost
+imbalanced-learn
+requests
+
+# Multi-agent chatbot dependencies
+langchain
+chromadb
+sentence-transformers

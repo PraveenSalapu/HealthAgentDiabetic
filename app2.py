@@ -29,10 +29,17 @@ import warnings
 from pathlib import Path
 import plotly.graph_objects as go
 import google.generativeai as genai
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
+
+from provider_search import (
+    ProviderRecord,
+    search_providers,
+    attempt_browser_booking,
+)
 import joblib
 import sklearn
 from xgboost import XGBClassifier
+import re
 
 # Suppress sklearn version warnings for better UX
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
@@ -41,9 +48,6 @@ warnings.filterwarnings('ignore', message='.*InconsistentVersionWarning.*')
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
-# Model paths (adjust as needed)
-# MODEL_PATH = "model_output/ml_xgboost_smoteenn_pipeline.pkl"
 
 MODEL_JSON_PATH = "model_output2/xgboost_model.json"
 PREPROCESSOR_PATH = "model_output2/preprocessor.pkl"
@@ -62,10 +66,12 @@ FEATURE_CONFIGS = {
     "HeartDiseaseorAttack": {"type": "select", "options": [0, 1], "labels": ["No", "Yes"]},
     "PhysHlth": {"type": "number", "min": 0, "max": 30, "default": 0, "step": 1,
                  "help": "Days of poor physical health in past 30 days"},
-    "Income": {"type": "number", "min": 1, "max": 8, "default": 4, "step": 1,
-               "help": "Income category (1=<$10k, 8=>$75k)"},
-    "Education": {"type": "number", "min": 1, "max": 6, "default": 4, "step": 1,
-                  "help": "Education level (1=Never, 6=College grad)"},
+    "Income": {"type": "select", 
+               "options": [1, 2, 3, 4, 5, 6, 7, 8],
+               "labels": ["<$10k", "$10k-15k", "$15k-20k", "$20k-25k", "$25k-35k", "$35k-50k", "$50k-75k", ">$75k"]},
+    "Education": {"type": "select",
+                  "options": [1, 2, 3, 4, 5, 6],
+                  "labels": ["Never attended", "Grades 1-8", "Grades 9-11", "High school/GED", "Some college", "College grad"]},
     "PhysActivity": {"type": "select", "options": [0, 1], "labels": ["No", "Yes"]}
 }
 
@@ -127,6 +133,344 @@ IDEAL_PROFILE = {
     "HighChol": 0,
 }
 
+AGENT_DEFINITIONS = {
+    "coach": {
+        "name": "Health Coach",
+        "avatar": "🧭",
+        "keywords": ["motivation", "routine", "habits", "exercise", "stress", "sleep", "plan"],
+        "system_prompt": (
+            "You are a supportive personal health coach helping someone interpret their diabetes risk results.\n"
+            "Risk probability: {probability:.1f}% ({risk_level}).\n"
+            "Key metrics:\n{profile_summary}\n\n"
+            "Focus on empowering next steps, mindset shifts, and habit coaching. Keep explanations warm and practical."
+        ),
+        "fallback_focus": (
+            "Focus on motivation, small habit changes, and balancing lifestyle pillars like sleep, stress, and movement."
+        ),
+    },
+    "doctor": {
+        "name": "Clinical Advisor",
+        "avatar": "🩺",
+        "keywords": ["symptom", "medication", "diagnosis", "doctor", "treatment", "blood test", "lab"],
+        "system_prompt": (
+            "You are a cautious clinician interpreting model findings without giving direct medical orders.\n"
+            "Risk probability: {probability:.1f}% ({risk_level}).\n"
+            "Key metrics:\n{profile_summary}\n\n"
+            "Highlight questions to raise with a physician, relevant screenings or labs, and safety precautions."
+        ),
+        "fallback_focus": (
+            "Suggest evidence-based checkpoints to review with a doctor and emphasize follow-up care."
+        ),
+    },
+    "dietician": {
+        "name": "Dietician",
+        "avatar": "🥗",
+        "keywords": ["diet", "meal", "food", "nutrition", "carb", "protein", "recipe", "eat"],
+        "system_prompt": (
+            "You are a registered dietician tailoring nutrition advice to the person's risk profile.\n"
+            "Risk probability: {probability:.1f}% ({risk_level}).\n"
+            "Key metrics:\n{profile_summary}\n\n"
+            "Offer practical meal planning, portion guidance, and nutrient strategies aligned with diabetes prevention."
+        ),
+        "fallback_focus": (
+            "Share carbohydrate awareness tips, balanced meals, hydration guidance, and mindful eating strategies."
+        ),
+    },
+    "scheduler": {
+        "name": "Care Concierge",
+        "avatar": "📅",
+        "keywords": ["appointment", "schedule", "book", "nearby", "consultant", "specialist", "clinic"],
+        "system_prompt": (
+            "You are a care coordinator helping the user plan follow-up appointments.\n"
+            "Risk probability: {probability:.1f}% ({risk_level}).\n"
+            "Key metrics:\n{profile_summary}\n\n"
+            "Recommend how to choose local clinicians, what to bring to visits, and how to manage scheduling."
+        ),
+        "fallback_focus": (
+            "Guide the user to gather insurance details, shortlist providers, prepare records, and set reminders."
+        ),
+    },
+}
+
+SCHEDULER_REQUIRED_FIELDS = [
+    ("location", "To find nearby specialists, what city or ZIP code works best for you?"),
+    ("specialty", "What type of clinician would you like to see (e.g., primary care, endocrinologist)?"),
+    ("date", "When would you like the appointment? Share a specific date or a window such as 'next week'."),
+]
+
+def format_feature_value(feature: str, value: float) -> str:
+    """Human readable representation for a feature value."""
+    config = FEATURE_CONFIGS.get(feature, {})
+    if not config:
+        return str(value)
+
+    if config.get("type") == "select":
+        options = config.get("options", [])
+        labels = config.get("labels", [])
+        try:
+            idx = options.index(int(value))
+            return labels[idx]
+        except (ValueError, IndexError):
+            return str(value)
+
+    if feature == "BMI":
+        return f"{value:.1f}"
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return f"{value}"
+
+
+def build_profile_summary(user_data: Dict[str, float]) -> str:
+    """Create a bullet summary of key user metrics."""
+    lines = []
+    for feature in FEATURE_CONFIGS:
+        if feature not in user_data:
+            continue
+        value = user_data[feature]
+        display = format_feature_value(feature, value)
+        lines.append(f"- {FEATURE_NAMES.get(feature, feature)}: {display}")
+    return "\n".join(lines)
+
+
+def determine_agent(user_message: str) -> str:
+    """Route the user message to the best-fit agent."""
+    text = user_message.lower()
+    for key, agent in AGENT_DEFINITIONS.items():
+        for keyword in agent["keywords"]:
+            if keyword in text:
+                return key
+    return "coach"
+
+
+def build_app_context(probability: float, user_data: Dict[str, float]) -> Dict[str, str]:
+    """Assemble common context fields for agents."""
+    risk_level, _, _ = classify_risk(probability)
+    return {
+        "probability": probability,
+        "risk_level": risk_level,
+        "profile_summary": build_profile_summary(user_data),
+    }
+
+
+def initialize_scheduler_flow():
+    """Ensure scheduler flow state exists."""
+    if "scheduler_flow" not in st.session_state:
+        st.session_state.scheduler_flow = {
+            "data": {},
+            "awaiting": None,
+            "stage": "collecting",
+            "suggestions": [],
+            "disclaimers": [],
+        }
+
+
+def reset_scheduler_flow():
+    """Reset scheduler-specific state."""
+    st.session_state.scheduler_flow = {
+        "data": {},
+        "awaiting": None,
+        "stage": "collecting",
+        "suggestions": [],
+        "disclaimers": [],
+    }
+
+
+def normalize_specialty(text: str) -> str:
+    value = text.lower().strip()
+    synonyms = {
+        "pcp": "primary care",
+        "primary doctor": "primary care",
+        "family doctor": "primary care",
+        "diabetes doctor": "endocrinologist",
+        "nutrition": "nutritionist",
+        "diet": "nutritionist",
+        "heart": "cardiologist",
+    }
+    for key, mapped in synonyms.items():
+        if key in value:
+            return mapped
+    return value
+
+
+def enrich_scheduler_data_from_message(flow: Dict[str, Any], message: str):
+    """Heuristically populate scheduler data from free-form text."""
+    text = message.strip()
+    if not text:
+        return
+
+    # Zip code extraction
+    if "location" not in flow["data"]:
+        zip_matches = re.findall(r"\b\d{5}\b", text)
+        if zip_matches:
+            flow["data"]["location"] = zip_matches[0]
+        else:
+            # simple city extraction after 'in'
+            lower = text.lower()
+            if " in " in lower:
+                potential = text.lower().split(" in ", 1)[1]
+                flow["data"]["location"] = potential.strip().strip(".?!")
+
+    if "specialty" not in flow["data"]:
+        flow["data"]["specialty"] = normalize_specialty(text)
+
+    if "date" not in flow["data"]:
+        if any(word in text.lower() for word in ["today", "tomorrow", "week", "month", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]):
+            flow["data"]["date"] = text
+
+
+def format_doctor_suggestions(doctors: List[Any], disclaimers: List[str]) -> str:
+    """Build markdown list of doctor suggestions."""
+    if not doctors:
+        return (
+            "I couldn't find a close match in the sample directory. Try broadening the location or specialty, "
+            "or let me know the city and provider type again."
+        )
+
+    lines = ["Here are top matches near you. Reply with the number of the doctor you'd like to book:"]
+    for idx, doc in enumerate(doctors, start=1):
+        if isinstance(doc, ProviderRecord):
+            accepting = "Accepting new patients" if doc.accepting_new else "Currently waitlisted"
+            distance = f"{doc.distance} miles away" if doc.distance is not None else "Distance not available"
+            rating = f"rating {doc.rating}/5" if doc.rating is not None else "no rating info"
+            availability = doc.next_availability or "Check availability"
+            city = doc.city
+            specialty = doc.specialty.title()
+        else:
+            accepting = "Accepting new patients" if doc.get("accepting_new") else "Currently waitlisted"
+            distance = f"{doc.get('distance')} miles away"
+            rating = f"rating {doc.get('rating')}/5" if doc.get("rating") is not None else "no rating info"
+            availability = doc.get("next_availability", "Check availability")
+            city = doc.get("city", "Unknown location")
+            specialty = doc.get("specialty", "clinic").title()
+        lines.append(
+            f"{idx}. **{doctor_to_display_name(doc)}** ({specialty}) — {city}, "
+            f"{distance}, {rating}. {accepting}. Next availability: {availability}."
+        )
+    if disclaimers:
+        lines.append("\n" + "\n".join(f"_Note: {text}_" for text in disclaimers))
+    lines.append("\nIf none of these work, describe different preferences (another location, specialty, or date).")
+    return "\n".join(lines)
+
+
+def process_scheduler_message(user_message: str,
+                              probability: float,
+                              user_data: Dict[str, float]) -> str:
+    """Handle structured scheduling workflow and return assistant reply."""
+    initialize_scheduler_flow()
+    flow = st.session_state.scheduler_flow
+
+    if flow.get("stage") == "selection":
+        return handle_scheduler_selection(flow, user_message, probability, user_data)
+
+    awaiting = flow.get("awaiting")
+    if awaiting:
+        flow["data"][awaiting] = user_message.strip()
+        flow["awaiting"] = None
+    else:
+        enrich_scheduler_data_from_message(flow, user_message)
+
+    for field, prompt in SCHEDULER_REQUIRED_FIELDS:
+        if not flow["data"].get(field):
+            flow["awaiting"] = field
+            return prompt
+
+    location = flow["data"]["location"]
+    specialty = flow["data"]["specialty"]
+    date_pref = flow["data"].get("date", "earliest available")
+    doctors, disclaimers = search_providers(location, specialty, date_pref)
+    flow["suggestions"] = doctors
+    flow["disclaimers"] = disclaimers
+
+    if not doctors:
+        flow["stage"] = "collecting"
+        flow["awaiting"] = None
+        message = "I couldn't find any nearby specialists with the current settings."
+        if disclaimers:
+            message += "\n" + "\n".join(disclaimers)
+        message += "\nTry another ZIP code, broader location, or different specialty."
+        return message
+
+    flow["stage"] = "selection"
+    flow["awaiting"] = None
+    return format_doctor_suggestions(doctors, disclaimers)
+
+
+def parse_doctor_selection(message: str, count: int) -> Optional[int]:
+    """Return zero-based index of selected doctor or None."""
+    matches = re.findall(r"\b(\d+)\b", message)
+    if matches:
+        idx = int(matches[0]) - 1
+        if 0 <= idx < count:
+            return idx
+    return None
+
+
+def doctor_to_display_name(doctor: Any) -> str:
+    if isinstance(doctor, ProviderRecord):
+        return doctor.name
+    if isinstance(doctor, dict):
+        return doctor.get("name", "the clinic")
+    return "the clinic"
+
+
+def doctor_to_url(doctor: Any) -> Optional[str]:
+    if isinstance(doctor, ProviderRecord):
+        return doctor.url
+    if isinstance(doctor, dict):
+        return doctor.get("url")
+    return None
+
+
+def handle_scheduler_selection(flow: Dict[str, Any],
+                               message: str,
+                               probability: float,
+                               user_data: Dict[str, float]) -> str:
+    doctors = flow.get("suggestions", [])
+    if not doctors:
+        flow["stage"] = "collecting"
+        return "I lost track of the suggested doctors. Could you share your location and specialty again?"
+
+    selection = parse_doctor_selection(message, len(doctors))
+    if selection is None:
+        return "Please reply with the number of the doctor you'd like to book (for example, '1' or 'Book option 2')."
+
+    chosen = doctors[selection]
+    url = doctor_to_url(chosen)
+    booking_summary = ""
+
+    booking_attempt = None
+    if isinstance(chosen, ProviderRecord):
+        try:
+            booking_attempt = attempt_browser_booking(
+                chosen,
+                {"profile": build_profile_summary(user_data), "probability": probability},
+                flow["data"].get("date", "earliest available"),
+            )
+        except Exception as exc:
+            st.info(f"Automated booking attempt failed: {exc}")
+
+    if booking_attempt:
+        booking_summary = booking_attempt
+    else:
+        booking_summary = (
+            "I'm unable to automate the booking directly. Here's how to proceed:\n"
+            f"1. Visit the clinic site: {url or 'contact the office directly'}.\n"
+            "2. Provide your preferred appointment window and confirm insurance coverage.\n"
+            "3. Ask for a confirmation email or text.\n"
+            "4. Add the appointment to your calendar and gather lab results or medications ahead of time."
+        )
+
+    display_name = doctor_to_display_name(chosen)
+    disclaimers = flow.get("disclaimers", [])
+    flow["stage"] = "collecting"
+    flow["suggestions"] = []
+    flow["disclaimers"] = []
+    flow["data"] = {}
+    flow["awaiting"] = None
+    extra = "\n\n" + "\n".join(disclaimers) if disclaimers else ""
+    return f"**Booking Summary for {display_name}**\n\n{booking_summary}{extra}"
+
 # Default averages (fallback if file not found or missing features)
 # Based on BRFSS 2015 diabetic population averages
 DEFAULT_DIABETIC_AVERAGES = {
@@ -147,75 +491,6 @@ DEFAULT_DIABETIC_AVERAGES = {
 # UTILITY FUNCTIONS
 # ============================================================================
 
-# def load_model(model_path: str):
-#     """Load the trained model from disk with version compatibility checks."""
-#     try:
-#         # Suppress sklearn warnings during loading
-#         with warnings.catch_warnings():
-#             warnings.simplefilter("ignore")
-#             # Try joblib first, then pickle
-#             try:
-#                 model = joblib.load(model_path)
-#             except:
-#                 import pickle
-#                 with open(model_path, 'rb') as f:
-#                     model = pickle.load(f)
-        
-#         # Check if it's a dict or other container
-#         if isinstance(model, dict):
-#             # Try to find the pipeline in the dict
-#             if 'pipeline' in model:
-#                 model = model['pipeline']
-#             elif 'model' in model:
-#                 model = model['model']
-#             else:
-#                 st.error("❌ Could not find pipeline in dictionary")
-#                 return None
-        
-#         # Check model type
-#         from sklearn.pipeline import Pipeline
-#         try:
-#             from imblearn.pipeline import Pipeline as ImbPipeline
-#             is_imblearn_pipeline = isinstance(model, ImbPipeline)
-#         except:
-#             is_imblearn_pipeline = False
-        
-#         is_sklearn_pipeline = isinstance(model, Pipeline)
-#         is_pipeline = is_sklearn_pipeline or is_imblearn_pipeline
-        
-#         # Verify it has predict method
-#         if not hasattr(model, 'predict'):
-#             st.error(f"❌ Loaded object is {type(model)} but has no 'predict' method")
-#             st.error("This might not be a trained model. Check how the model was saved.")
-#             return None
-        
-#         # Verify model can make predictions
-#         try:
-#             # Test prediction with dummy data in CORRECT ORDER
-#             test_features = list(FEATURE_CONFIGS.keys())
-#             test_data = pd.DataFrame([{f: 0 if FEATURE_CONFIGS[f]["type"] == "select" 
-#                                        else FEATURE_CONFIGS[f]["default"] 
-#                                        for f in test_features}])
-            
-#             _ = model.predict(test_data)
-            
-#             return model
-#         except Exception as pred_error:
-#             st.error(f"⚠️ Model loaded but prediction test failed: {pred_error}")
-#             st.error(f"Error type: {type(pred_error).__name__}")
-#             import traceback
-#             st.code(traceback.format_exc())
-#             st.warning("The model may be incompatible with the current scikit-learn version or feature order is wrong.")
-#             return None
-            
-#     except Exception as e:
-#         st.error(f"❌ Error loading model from {model_path}: {e}")
-#         st.info("💡 Tip: Ensure the model file exists and was created with a compatible scikit-learn version.")
-#         import traceback
-#         st.code(traceback.format_exc())
-#         return None
-
-# NEW FUNCTION: Load model components separately
 def load_model_components(model_json_path: str, preprocessor_path: str, threshold_path: str):
     """
     Load XGBoost model (JSON), preprocessor (pkl), and optimal threshold.
@@ -383,30 +658,34 @@ def create_comparison_chart(user_data: Dict[str, float],
         x=features,
         y=user_values,
         marker=dict(
-            color='#2563EB',
-            line=dict(color='#1E3A8A', width=1.2)
+            color='#00d9ff',
+            line=dict(color='#00b8d4', width=1.5),
+            pattern=dict(shape="")
         ),
         text=[f'{v:.1f}' for v in user_values],
         textposition='outside',
-        textfont=dict(color='#e2e8f0', size=13, family='"Inter","Segoe UI",sans-serif')
+        textfont=dict(color='#f1f5f9', size=13, family='"Inter","Segoe UI",sans-serif', weight=600)
     ))
-    
+
     # Average diabetic values
     fig.add_trace(go.Bar(
         name='Avg. Diabetic Population',
         x=features,
         y=avg_values,
         marker=dict(
-            color='#A855F7',
-            line=dict(color='#6D28D9', width=1.2)
+            color='#7c3aed',
+            line=dict(color='#6d28d9', width=1.5)
         ),
         text=[f'{v:.1f}' for v in avg_values],
         textposition='outside',
-        textfont=dict(color='#e2e8f0', size=13, family='"Inter","Segoe UI",sans-serif')
+        textfont=dict(color='#cbd5e1', size=13, family='"Inter","Segoe UI",sans-serif', weight=500)
     ))
     
     fig.update_layout(
-        title='Your Health Metrics vs. Average Diabetic Population',
+        title=dict(
+            text='Your Health Metrics vs. Average Diabetic Population',
+            font=dict(size=18, color='#f1f5f9', family='"Inter","Segoe UI",sans-serif', weight=700)
+        ),
         xaxis_title='Health Factors',
         yaxis_title='Value',
         barmode='group',
@@ -419,27 +698,28 @@ def create_comparison_chart(user_data: Dict[str, float],
             y=1.02,
             xanchor="right",
             x=1,
-            bgcolor='rgba(11,17,32,0.85)',
-            bordercolor='#1f2a4d',
-            borderwidth=1
+            bgcolor='rgba(26, 35, 66, 0.85)',
+            bordercolor='rgba(100, 116, 255, 0.3)',
+            borderwidth=1.5,
+            font=dict(color='#cbd5e1', size=12)
         ),
         uniformtext=dict(mode="show", minsize=12),
-        paper_bgcolor='#0b1120',
-        plot_bgcolor='#111c3a',
-        font=dict(color='#e2e8f0', family='"Inter","Segoe UI",sans-serif'),
+        paper_bgcolor='rgba(10, 14, 26, 0.5)',
+        plot_bgcolor='rgba(21, 29, 53, 0.5)',
+        font=dict(color='#cbd5e1', family='"Inter","Segoe UI",sans-serif'),
         margin=dict(l=40, r=40, t=80, b=40)
     )
-    
+
     fig.update_xaxes(
         tickangle=-35,
         showgrid=False,
-        linecolor='#1f2a4d',
-        tickfont=dict(color='#cbd5f5', size=12, family='"Inter","Segoe UI",sans-serif')
+        linecolor='rgba(100, 116, 255, 0.2)',
+        tickfont=dict(color='#cbd5e1', size=12, family='"Inter","Segoe UI",sans-serif')
     )
     fig.update_yaxes(
-        gridcolor='#1f2a4d',
-        zerolinecolor='#1f2a4d',
-        tickfont=dict(color='#cbd5f5', size=12, family='"Inter","Segoe UI",sans-serif')
+        gridcolor='rgba(100, 116, 255, 0.15)',
+        zerolinecolor='rgba(100, 116, 255, 0.2)',
+        tickfont=dict(color='#cbd5e1', size=12, family='"Inter","Segoe UI",sans-serif')
     )
     
     return fig, differences
@@ -473,37 +753,44 @@ def create_risk_gauge(probability: float) -> go.Figure:
         domain={'x': [0, 1], 'y': [0, 1]},
         title={
             'text': "Diabetes Risk Probability",
-            'font': {'size': 24, 'color': '#f8fafc', 'family': '"Inter","Segoe UI",sans-serif'}
+            'font': {'size': 22, 'color': '#f1f5f9', 'family': '"Inter","Segoe UI",sans-serif', 'weight': 700}
         },
-        number={'suffix': "%", 'font': {'size': 48, 'color': '#f8fafc', 'family': '"Inter","Segoe UI",sans-serif'}},
+        number={
+            'suffix': "%",
+            'font': {'size': 52, 'color': '#00d9ff', 'family': '"Inter","Segoe UI",sans-serif', 'weight': 800}
+        },
         gauge={
             'axis': {
                 'range': [None, 100],
-                'tickwidth': 1,
-                'tickcolor': "#1e293b",
-                'tickfont': {'color': '#cbd5f5', 'family': '"Inter","Segoe UI",sans-serif'}
+                'tickwidth': 1.5,
+                'tickcolor': "rgba(100, 116, 255, 0.3)",
+                'tickfont': {'color': '#cbd5e1', 'family': '"Inter","Segoe UI",sans-serif', 'size': 11}
             },
-            'bar': {'color': "#38bdf8"},
-            'bgcolor': "#111c3a",
+            'bar': {
+                'color': "#00d9ff",
+                'thickness': 0.8
+            },
+            'bgcolor': "rgba(21, 29, 53, 0.5)",
             'borderwidth': 2,
-            'bordercolor': "#1f2a4d",
+            'bordercolor': "rgba(100, 116, 255, 0.3)",
             'steps': [
-                {'range': [0, 30], 'color': '#134e4a'},
-                {'range': [30, 60], 'color': '#78350f'},
-                {'range': [60, 100], 'color': '#7f1d1d'}
+                {'range': [0, 30], 'color': 'rgba(16, 185, 129, 0.3)'},
+                {'range': [30, 60], 'color': 'rgba(251, 191, 36, 0.3)'},
+                {'range': [60, 100], 'color': 'rgba(248, 113, 113, 0.3)'}
             ],
             'threshold': {
-                'line': {'color': "#f97316", 'width': 4},
-                'thickness': 0.75,
+                'line': {'color': "#7c3aed", 'width': 5},
+                'thickness': 0.8,
                 'value': probability
             }
         }
     ))
-    
+
     fig.update_layout(
-        height=300,
-        margin=dict(l=20, r=20, t=60, b=20),
-        paper_bgcolor='#0b1120'
+        height=320,
+        margin=dict(l=20, r=20, t=70, b=20),
+        paper_bgcolor='rgba(10, 14, 26, 0)',
+        font=dict(family='"Inter","Segoe UI",sans-serif')
     )
     return fig
 
@@ -544,27 +831,36 @@ def create_contribution_waterfall(user_data: Dict[str, float],
             measure=["relative"] * len(deltas),
             y=labels,
             x=deltas,
-            connector={"mode": "spanning", "line": {"color": "#1f2a4d", "width": 1}},
-            decreasing={"marker": {"color": "#f87171"}},
-            increasing={"marker": {"color": "#38bdf8"}},
+            connector={"mode": "spanning", "line": {"color": "rgba(100, 116, 255, 0.3)", "width": 2}},
+            decreasing={"marker": {"color": "#10b981", "line": {"color": "#059669", "width": 1}}},
+            increasing={"marker": {"color": "#f87171", "line": {"color": "#ef4444", "width": 1}}},
+            textposition="outside",
+            textfont=dict(color='#cbd5e1', family='"Inter","Segoe UI",sans-serif', size=11)
         )
     )
 
     fig.update_layout(
-        title="Feature shifts versus diabetic average (normalized)",
+        title=dict(
+            text="Feature shifts versus diabetic average (normalized)",
+            font=dict(size=18, color='#f1f5f9', family='"Inter","Segoe UI",sans-serif', weight=700)
+        ),
         showlegend=False,
         height=420,
         margin=dict(l=120, r=30, t=60, b=40),
-        paper_bgcolor="#0b1120",
-        plot_bgcolor="#111c3a",
-        font=dict(color="#e2e8f0", family='"Inter","Segoe UI",sans-serif'),
+        paper_bgcolor="rgba(10, 14, 26, 0.5)",
+        plot_bgcolor="rgba(21, 29, 53, 0.5)",
+        font=dict(color="#cbd5e1", family='"Inter","Segoe UI",sans-serif'),
         xaxis=dict(
             title="Relative shift (percentage points)",
-            gridcolor="#1f2a4d",
-            zerolinecolor="#1f2a4d",
-            tickfont=dict(color="#cbd5f5"),
+            gridcolor="rgba(100, 116, 255, 0.15)",
+            zerolinecolor="rgba(100, 116, 255, 0.3)",
+            tickfont=dict(color="#cbd5e1"),
+            title_font=dict(color="#94a3b8")
         ),
-        yaxis=dict(tickfont=dict(color="#cbd5f5")),
+        yaxis=dict(
+            tickfont=dict(color="#cbd5e1"),
+            gridcolor="rgba(100, 116, 255, 0.1)"
+        ),
     )
 
     return fig
@@ -626,8 +922,8 @@ def create_wellness_radar(user_data: Dict[str, float],
 
     fig = go.Figure()
     palette = {
-        "Your profile": "#38bdf8",
-        "Ideal baseline": "#22d3ee",
+        "Your profile": "#00d9ff",
+        "Ideal baseline": "#10b981",
         "Diabetic average": "#f97316",
     }
 
@@ -649,11 +945,16 @@ def create_wellness_radar(user_data: Dict[str, float],
                 range=[0, 1],
                 showticklabels=True,
                 ticks="",
-                tickfont=dict(size=10, color="#cbd5f5"),
-                gridcolor="#1f2a4d",
-                linecolor="#1f2a4d",
+                tickfont=dict(size=10, color="#cbd5e1"),
+                gridcolor="rgba(100, 116, 255, 0.2)",
+                linecolor="rgba(100, 116, 255, 0.3)",
             ),
-            bgcolor="#111c3a",
+            bgcolor="rgba(21, 29, 53, 0.5)",
+            angularaxis=dict(
+                gridcolor="rgba(100, 116, 255, 0.2)",
+                linecolor="rgba(100, 116, 255, 0.3)",
+                tickfont=dict(color="#cbd5e1", family='"Inter","Segoe UI",sans-serif', size=11)
+            )
         ),
         legend=dict(
             orientation="h",
@@ -661,13 +962,19 @@ def create_wellness_radar(user_data: Dict[str, float],
             y=1.05,
             xanchor="center",
             x=0.5,
-            font=dict(color="#cbd5f5"),
+            font=dict(color="#cbd5e1", family='"Inter","Segoe UI",sans-serif'),
+            bgcolor="rgba(26, 35, 66, 0.7)",
+            bordercolor="rgba(100, 116, 255, 0.3)",
+            borderwidth=1
         ),
-        margin=dict(l=40, r=40, t=60, b=40),
-        paper_bgcolor="#0b1120",
-        title="Wellness balance across key factors",
-        font=dict(color="#e2e8f0", family='"Inter","Segoe UI",sans-serif'),
-        height=420,
+        margin=dict(l=40, r=40, t=80, b=40),
+        paper_bgcolor="rgba(10, 14, 26, 0.5)",
+        title=dict(
+            text="Wellness balance across key factors",
+            font=dict(size=18, color='#f1f5f9', family='"Inter","Segoe UI",sans-serif', weight=700)
+        ),
+        font=dict(color="#cbd5e1", family='"Inter","Segoe UI",sans-serif'),
+        height=450,
     )
 
     return fig
@@ -709,25 +1016,25 @@ def generate_insights(user_data: Dict[str, float],
 # CHATBOT FUNCTIONS
 # ============================================================================
 
-def send_message_to_gemini(model, chat_history: List[Dict[str, str]], 
-                          user_message: str) -> str:
+def send_message_to_gemini(model,
+                           agent_key: str,
+                           conversation: List[Dict[str, str]],
+                           user_message: str,
+                           context: Dict[str, str]) -> str:
     """Send message to Gemini and get response."""
     try:
+        agent = AGENT_DEFINITIONS[agent_key]
+        system_prompt = agent["system_prompt"].format(**context)
+
         # Build conversation history
         chat = model.start_chat(history=[])
-        
-        # Send system prompt as first message if this is the start
-        if len(chat_history) == 0:
-            system_msg = st.session_state.get('system_prompt', '')
-            if system_msg:
-                chat.send_message(system_msg)
-        
-        # Send previous messages
-        for msg in chat_history:
-            if msg['role'] == 'user':
-                chat.send_message(msg['content'])
-            # Assistant messages are already in history
-        
+
+        chat.send_message(system_prompt)
+
+        # Send previous messages for this agent
+        for msg in conversation:
+            chat.send_message(msg['content'])
+
         # Send current message
         response = chat.send_message(user_message)
         return response.text
@@ -738,52 +1045,70 @@ def send_message_to_gemini(model, chat_history: List[Dict[str, str]],
 
 def generate_fallback_response(probability: float,
                                user_data: Dict[str, float],
+                               agent_key: str,
                                user_message: Optional[str] = None) -> str:
     """Provide an on-device assistant response when Gemini is unavailable."""
-    risk_level, _, risk_message = classify_risk(probability)
+    agent = AGENT_DEFINITIONS[agent_key]
+    context = build_app_context(probability, user_data)
+    risk_level = context["risk_level"]
     summary = (
-        f"The assessment estimates a {probability:.1f}% likelihood of diabetes, "
-        f"which places you in the {risk_level.lower()} risk range. {risk_message}"
+        f"{agent['name']} (fallback)\n"
+        f"- Estimated diabetes probability: {probability:.1f}% ({risk_level.lower()} risk)\n"
+        f"- Key health snapshot:\n{context['profile_summary']}"
     )
 
-    lifestyle_hints: List[str] = []
     bmi = user_data.get("BMI")
-    if bmi is not None and bmi >= 30:
-        lifestyle_hints.append(
-            "Set a realistic weekly movement goal and focus on gradual weight management."
-        )
-    if user_data.get("PhysActivity") == 0:
-        lifestyle_hints.append(
-            "Incorporate at least 150 minutes of moderate activity per week, even if you start with 10-minute walks."
-        )
-    if user_data.get("HighBP") == 1:
-        lifestyle_hints.append(
-            "Monitor blood pressure regularly and discuss medication adherence with your clinician."
-        )
-    if user_data.get("HighChol") == 1:
-        lifestyle_hints.append(
-            "Review cholesterol numbers with your care team and ask whether dietary adjustments could help."
-        )
+    phys_activity = user_data.get("PhysActivity")
+    high_bp = user_data.get("HighBP")
+    high_chol = user_data.get("HighChol")
 
-    if not lifestyle_hints:
-        lifestyle_hints.append(
-            "Keep reinforcing balanced nutrition, regular movement, quality sleep, and stress reduction."
-        )
+    guidance: List[str] = []
 
-    action_plan = "Here are next steps to consider:\n- " + "\n- ".join(lifestyle_hints[:3])
+    if agent_key == "coach":
+        if phys_activity == 0:
+            guidance.append("Start with 10-minute movement blocks after meals to wake up insulin sensitivity.")
+        if bmi and bmi >= 30:
+            guidance.append("Set a modest weight trend goal (e.g., 3-5% over 3 months) paired with resistance work.")
+        guidance.append("Use a habit tracker this week: log sleep hours, stress triggers, and screen-time after 9pm.")
+
+    elif agent_key == "doctor":
+        guidance.append("Schedule an A1C or oral glucose tolerance test if it has been more than 12 months.")
+        if high_bp == 1:
+            guidance.append("Bring a log of home blood pressure readings to your next visit.")
+        guidance.append("Ask whether cholesterol, kidney function (eGFR), and retinal screening are due.")
+        guidance.append("Prepare a list of medications and supplements before the appointment.")
+
+    elif agent_key == "dietician":
+        if bmi and bmi >= 28:
+            guidance.append("Build plates with half non-starchy vegetables, quarter lean protein, quarter high-fiber carbs.")
+        guidance.append("Aim for ~25-30g fiber daily from beans, berries, chia, or whole grains.")
+        if high_chol == 1:
+            guidance.append("Swap saturated fats for olive oil, avocado, and nuts to support lipid levels.")
+        guidance.append("Batch-prep breakfast options (e.g., chia pudding, veggie omelets) to prevent morning spikes.")
+
+    elif agent_key == "scheduler":
+        guidance.append("Verify insurance network and telehealth options, then shortlist endocrinologists or PCPs.")
+        guidance.append("Compile labs, device readings, and symptom notes to share ahead of the visit.")
+        guidance.append("Ask clinics about wait times and cancellation policies; set calendar reminders 24 hours prior.")
+        guidance.append("If you need a dietician referral, request it during the primary appointment.")
+
+    if not guidance:
+        guidance.append(agent["fallback_focus"])
+
+    action_plan = "Key suggestions:\n- " + "\n- ".join(guidance[:4])
 
     if user_message:
         return (
             f"You asked: \"{user_message}\".\n\n"
             f"{summary}\n\n"
             f"{action_plan}\n\n"
-            "Always review these ideas with a healthcare professional who knows your full history."
+            "Always confirm these ideas with a healthcare professional who knows your full history."
         )
 
     return (
         f"{summary}\n\n"
         f"{action_plan}\n\n"
-        "Use the chat to dig deeper into lifestyle changes, lab tests, or questions for your next appointment."
+        "Let me know if you want to dive deeper into any of these steps."
     )
 
 # ============================================================================
@@ -806,6 +1131,11 @@ def initialize_session_state():
         st.session_state.system_prompt = ""
     if 'optimal_threshold' not in st.session_state:
         st.session_state.optimal_threshold = 0.5
+    if 'agent_histories' not in st.session_state:
+        st.session_state.agent_histories = {key: [] for key in AGENT_DEFINITIONS}
+    if 'active_agent' not in st.session_state:
+        st.session_state.active_agent = "coach"
+    initialize_scheduler_flow()
 
 def reset_app():
     """Reset application state."""
@@ -817,6 +1147,9 @@ def reset_app():
     st.session_state.system_prompt = ""
     default_threshold = st.session_state.get("optimal_threshold_default", 0.5)
     st.session_state.optimal_threshold = default_threshold
+    st.session_state.agent_histories = {key: [] for key in AGENT_DEFINITIONS}
+    st.session_state.active_agent = "coach"
+    reset_scheduler_flow()
 
 
 def main():
@@ -829,284 +1162,874 @@ def main():
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
         :root {
             color-scheme: dark;
+            --bg-primary: #0a0e1a;
+            --bg-secondary: #0f1629;
+            --bg-tertiary: #151d35;
+            --bg-card: #1a2342;
+            --accent-primary: #00d9ff;
+            --accent-secondary: #7c3aed;
+            --accent-tertiary: #f97316;
+            --text-primary: #f1f5f9;
+            --text-secondary: #cbd5e1;
+            --text-muted: #94a3b8;
+            --border-color: rgba(100, 116, 255, 0.15);
+            --glow-color: rgba(0, 217, 255, 0.3);
         }
+
+        /* Main background with gradient */
         body, .stApp {
-            background-color: #0b1120 !important;
-            color: #e2e8f0 !important;
-            font-family: "Inter", "Segoe UI", sans-serif !important;
+            background: linear-gradient(135deg, #0a0e1a 0%, #151d35 50%, #0f1320 100%) !important;
+            color: var(--text-primary) !important;
+            font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
         }
+
         div[data-testid="stAppViewContainer"] {
-            background-color: #0b1120 !important;
+            background: linear-gradient(135deg, #0a0e1a 0%, #151d35 50%, #0f1320 100%) !important;
         }
+
         div[data-testid="stSidebar"] {
-            background-color: #111c3a !important;
+            background: linear-gradient(180deg, #0f1629 0%, #1a2342 100%) !important;
+            border-right: 1px solid var(--border-color) !important;
         }
+
+        /* Typography enhancements */
         .stApp h1, .stApp h2, .stApp h3, .stApp h4 {
-            color: #f8fafc !important;
+            color: var(--text-primary) !important;
+            font-weight: 700 !important;
+            letter-spacing: -0.025em !important;
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.3) !important;
         }
+
         .stMarkdown, .stMarkdown p, .stMarkdown span, .stMarkdown li, .stMarkdown strong, .stMarkdown em {
-            color: #e2e8f0 !important;
+            color: var(--text-secondary) !important;
         }
+
+        /* Enhanced Primary Button */
         button[kind="primary"] {
-            background: linear-gradient(135deg, #38bdf8, #2563eb) !important;
-            color: #0b1120 !important;
-            border: 1px solid #38bdf8 !important;
-            border-radius: 14px !important;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)) !important;
+            color: #ffffff !important;
+            border: none !important;
+            border-radius: 16px !important;
             font-weight: 600 !important;
-            box-shadow: 0 18px 38px rgba(37, 99, 235, 0.35) !important;
+            padding: 0.75rem 2rem !important;
+            box-shadow:
+                0 4px 16px rgba(0, 217, 255, 0.25),
+                0 8px 32px rgba(124, 58, 237, 0.2),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1) !important;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            position: relative !important;
+            overflow: hidden !important;
         }
+
+        button[kind="primary"]::before {
+            content: '' !important;
+            position: absolute !important;
+            top: 0 !important;
+            left: -100% !important;
+            width: 100% !important;
+            height: 100% !important;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent) !important;
+            transition: left 0.5s !important;
+        }
+
         button[kind="primary"]:hover {
-            background: linear-gradient(135deg, #1d4ed8, #1e40af) !important;
+            transform: translateY(-2px) scale(1.02) !important;
+            box-shadow:
+                0 6px 24px rgba(0, 217, 255, 0.4),
+                0 12px 48px rgba(124, 58, 237, 0.3),
+                inset 0 1px 0 rgba(255, 255, 255, 0.2) !important;
         }
+
+        button[kind="primary"]:hover::before {
+            left: 100% !important;
+        }
+
+        button[kind="primary"]:active {
+            transform: translateY(0) scale(0.98) !important;
+        }
+
+        /* Enhanced Secondary Button */
         button[kind="secondary"] {
-            background: transparent !important;
-            color: #60a5fa !important;
-            border: 1px solid #1d4ed8 !important;
-            border-radius: 14px !important;
+            background: rgba(0, 217, 255, 0.05) !important;
+            color: var(--accent-primary) !important;
+            border: 1.5px solid rgba(0, 217, 255, 0.3) !important;
+            border-radius: 16px !important;
             font-weight: 600 !important;
+            padding: 0.75rem 1.5rem !important;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            backdrop-filter: blur(10px) !important;
         }
+
         button[kind="secondary"]:hover {
-            background: rgba(37, 99, 235, 0.15) !important;
+            background: rgba(0, 217, 255, 0.12) !important;
+            border-color: var(--accent-primary) !important;
+            box-shadow: 0 4px 16px rgba(0, 217, 255, 0.2) !important;
+            transform: translateY(-1px) !important;
         }
+
+        button[kind="secondary"]:active {
+            transform: translateY(0) !important;
+        }
+        /* Glassmorphic Form */
         form[data-testid="stForm"] {
-            background: #111c3a !important;
-            border: 1px solid #1f2a4d !important;
-            border-radius: 22px !important;
-            padding: 2.2rem !important;
-            box-shadow: 0 28px 55px rgba(15, 23, 42, 0.5) !important;
+            background: linear-gradient(135deg, rgba(26, 35, 66, 0.8), rgba(21, 29, 53, 0.9)) !important;
+            backdrop-filter: blur(20px) !important;
+            -webkit-backdrop-filter: blur(20px) !important;
+            border: 1.5px solid rgba(100, 116, 255, 0.2) !important;
+            border-radius: 28px !important;
+            padding: 2.5rem !important;
+            box-shadow:
+                0 8px 32px rgba(0, 0, 0, 0.3),
+                0 2px 8px rgba(124, 58, 237, 0.1),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+            position: relative !important;
+            overflow: hidden !important;
         }
+
+        form[data-testid="stForm"]::before {
+            content: '' !important;
+            position: absolute !important;
+            top: 0 !important;
+            left: -50% !important;
+            width: 200% !important;
+            height: 100% !important;
+            background: radial-gradient(circle at 50% 50%, rgba(0, 217, 255, 0.03), transparent 70%) !important;
+            animation: formGlow 8s ease-in-out infinite !important;
+        }
+
+        @keyframes formGlow {
+            0%, 100% { transform: translateX(0) scale(1); opacity: 0.5; }
+            50% { transform: translateX(25%) scale(1.1); opacity: 0.8; }
+        }
+
         form[data-testid="stForm"] label {
             font-weight: 600 !important;
-            color: #e2e8f0 !important;
+            color: var(--text-primary) !important;
+            font-size: 0.95rem !important;
+            letter-spacing: 0.01em !important;
+            margin-bottom: 0.5rem !important;
+            display: block !important;
         }
+
         .form-section-header h3 {
-            margin-bottom: 0.25rem;
-            color: #f1f5f9;
+            margin-bottom: 0.5rem !important;
+            color: var(--text-primary) !important;
+            font-size: 1.35rem !important;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)) !important;
+            -webkit-background-clip: text !important;
+            -webkit-text-fill-color: transparent !important;
+            background-clip: text !important;
         }
+
         .form-section-header p {
-            margin-top: 0;
-            color: #94a3b8;
+            margin-top: 0 !important;
+            color: var(--text-muted) !important;
+            font-size: 0.9rem !important;
+            line-height: 1.6 !important;
         }
+
         .form-section-divider {
-            border: 0;
-            height: 1px;
-            background: linear-gradient(90deg, rgba(148, 163, 184, 0.1), rgba(148, 163, 184, 0));
+            border: 0 !important;
+            height: 2px !important;
+            background: linear-gradient(
+                90deg,
+                transparent,
+                rgba(0, 217, 255, 0.3) 20%,
+                rgba(124, 58, 237, 0.3) 80%,
+                transparent
+            ) !important;
+            margin: 2rem 0 !important;
+            border-radius: 2px !important;
         }
+
+        /* Enhanced Input Fields */
         .stApp input, .stApp textarea, div[data-baseweb="input"] input {
-            background-color: #0f172a !important;
-            color: #f8fafc !important;
-            border: 1px solid #334155 !important;
-            border-radius: 12px !important;
+            background: rgba(10, 14, 26, 0.6) !important;
+            color: var(--text-primary) !important;
+            border: 1.5px solid rgba(100, 116, 255, 0.25) !important;
+            border-radius: 14px !important;
+            padding: 0.75rem 1rem !important;
+            font-size: 0.95rem !important;
+            font-weight: 500 !important;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            box-shadow:
+                0 2px 8px rgba(0, 0, 0, 0.2),
+                inset 0 1px 0 rgba(255, 255, 255, 0.03) !important;
         }
+
+        .stApp input:focus, .stApp textarea:focus, div[data-baseweb="input"] input:focus {
+            background: rgba(10, 14, 26, 0.8) !important;
+            border-color: var(--accent-primary) !important;
+            box-shadow:
+                0 0 0 3px rgba(0, 217, 255, 0.15),
+                0 4px 16px rgba(0, 217, 255, 0.25),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+            outline: none !important;
+        }
+
+        /* Enhanced Select Dropdown */
+        div[data-baseweb="select"] {
+            background: transparent !important;
+        }
+
         div[data-baseweb="select"] > div {
-            background-color: #0f172a !important;
-            color: #f8fafc !important;
-            border: 1px solid #334155 !important;
-            border-radius: 12px !important;
+            background: rgba(10, 14, 26, 0.6) !important;
+            color: var(--text-primary) !important;
+            border: 1.5px solid rgba(100, 116, 255, 0.25) !important;
+            border-radius: 14px !important;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            box-shadow:
+                0 2px 8px rgba(0, 0, 0, 0.2),
+                inset 0 1px 0 rgba(255, 255, 255, 0.03) !important;
+            padding-right: 2.5rem !important;
+            font-weight: 500 !important;
         }
+
+        div[data-baseweb="select"] > div:hover {
+            border-color: rgba(0, 217, 255, 0.4) !important;
+            box-shadow:
+                0 4px 12px rgba(0, 217, 255, 0.2),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+            background: rgba(10, 14, 26, 0.8) !important;
+        }
+
+        div[data-baseweb="select"] svg {
+            color: var(--accent-primary) !important;
+            opacity: 0.8 !important;
+        }
+
+        /* Dropdown menu */
+        div[data-baseweb="popover"] {
+            background: rgba(15, 23, 42, 0.98) !important;
+            backdrop-filter: blur(20px) !important;
+            -webkit-backdrop-filter: blur(20px) !important;
+            border: 1.5px solid rgba(100, 116, 255, 0.3) !important;
+            border-radius: 14px !important;
+            box-shadow:
+                0 8px 32px rgba(0, 0, 0, 0.5),
+                0 2px 8px rgba(0, 217, 255, 0.1) !important;
+            overflow: hidden !important;
+        }
+
+        div[role="listbox"] {
+            background: transparent !important;
+            padding: 0.5rem !important;
+        }
+
+        div[role="option"] {
+            color: var(--text-secondary) !important;
+            transition: all 0.2s ease !important;
+            padding: 0.75rem 1rem !important;
+            border-radius: 10px !important;
+            margin-bottom: 0.25rem !important;
+            font-weight: 500 !important;
+        }
+
+        div[role="option"]:hover {
+            background: rgba(0, 217, 255, 0.15) !important;
+            color: var(--text-primary) !important;
+            transform: translateX(4px) !important;
+        }
+
+        div[role="option"][aria-selected="true"] {
+            background: rgba(0, 217, 255, 0.2) !important;
+            color: var(--accent-primary) !important;
+            font-weight: 600 !important;
+        }
+
+        /* Number Input Styling */
         div[data-testid="stNumberInput"] input {
-            background-color: #0f172a !important;
-            color: #f8fafc !important;
+            background: rgba(10, 14, 26, 0.6) !important;
+            color: var(--text-primary) !important;
         }
+
         div[data-testid="stNumberInput"] button {
-            background-color: #1e293b !important;
-            color: #cbd5f5 !important;
+            background: rgba(0, 217, 255, 0.1) !important;
+            color: var(--accent-primary) !important;
+            border-radius: 8px !important;
+            border: 1px solid rgba(0, 217, 255, 0.2) !important;
+            transition: all 0.2s ease !important;
         }
+
+        div[data-testid="stNumberInput"] button:hover {
+            background: rgba(0, 217, 255, 0.2) !important;
+            border-color: var(--accent-primary) !important;
+            transform: scale(1.05) !important;
+        }
+
+        /* Selectbox text color */
+        div[data-baseweb="select"] div[role="button"] {
+            color: var(--text-primary) !important;
+        }
+
+        div[data-baseweb="select"] span {
+            color: var(--text-primary) !important;
+        }
+
+        /* Help tooltip icon */
+        div[data-testid="stTooltipIcon"] svg {
+            color: var(--accent-primary) !important;
+            opacity: 0.7 !important;
+        }
+
+        div[data-testid="stTooltipIcon"]:hover svg {
+            opacity: 1 !important;
+        }
+
+        /* Input placeholder text */
+        .stApp input::placeholder, .stApp textarea::placeholder {
+            color: var(--text-muted) !important;
+            opacity: 0.6 !important;
+        }
+
+        /* Labels and captions */
+        .stApp label {
+            color: var(--text-primary) !important;
+        }
+
+        .stApp .stMarkdown p, .stApp .stCaption {
+            color: var(--text-secondary) !important;
+        }
+
+        div[data-testid="stCaptionContainer"] {
+            color: var(--text-muted) !important;
+        }
+
+        /* Fix expander background */
+        div[data-testid="stExpander"] {
+            background: transparent !important;
+            border: 1.5px solid rgba(100, 116, 255, 0.2) !important;
+            border-radius: 14px !important;
+        }
+
+        div[data-testid="stExpander"] div[role="button"] {
+            background: transparent !important;
+            color: var(--text-primary) !important;
+        }
+
+        div[data-testid="stExpanderDetails"] {
+            background: rgba(21, 29, 53, 0.3) !important;
+            border-top: 1px solid rgba(100, 116, 255, 0.15) !important;
+        }
+
+        /* Alert boxes */
+        div[data-testid="stAlert"] {
+            background: transparent !important;
+            backdrop-filter: blur(10px) !important;
+            border-radius: 14px !important;
+        }
+
+        div[data-testid="stSuccess"] {
+            background: rgba(16, 185, 129, 0.1) !important;
+            border: 1.5px solid rgba(16, 185, 129, 0.3) !important;
+            color: #6ee7b7 !important;
+        }
+
+        div[data-testid="stWarning"] {
+            background: rgba(251, 191, 36, 0.1) !important;
+            border: 1.5px solid rgba(251, 191, 36, 0.3) !important;
+            color: #fcd34d !important;
+        }
+
+        div[data-testid="stError"] {
+            background: rgba(248, 113, 113, 0.1) !important;
+            border: 1.5px solid rgba(248, 113, 113, 0.3) !important;
+            color: #fca5a5 !important;
+        }
+
+        div[data-testid="stInfo"] {
+            background: rgba(0, 217, 255, 0.1) !important;
+            border: 1.5px solid rgba(0, 217, 255, 0.3) !important;
+            color: var(--accent-primary) !important;
+        }
+
+        /* Dataframe styling */
+        div[data-testid="stDataFrame"] {
+            background: transparent !important;
+        }
+
+        div[data-testid="stDataFrame"] table {
+            background: rgba(21, 29, 53, 0.5) !important;
+            color: var(--text-secondary) !important;
+        }
+
+        div[data-testid="stDataFrame"] th {
+            background: rgba(0, 217, 255, 0.15) !important;
+            color: var(--text-primary) !important;
+            border-color: rgba(100, 116, 255, 0.2) !important;
+        }
+
+        div[data-testid="stDataFrame"] td {
+            border-color: rgba(100, 116, 255, 0.15) !important;
+            color: var(--text-secondary) !important;
+        }
+
+        /* Hide any duplicate select elements or values */
+        div[data-baseweb="select"] li[role="option"] span:last-child:empty {
+            display: none !important;
+        }
+
+        /* Ensure clean single dropdown rendering */
+        div[data-baseweb="select"] ul[role="listbox"] {
+            list-style: none !important;
+            padding: 0.5rem !important;
+        }
+
+        /* Clean dropdown button display - show only the formatted label */
+        div[data-baseweb="select"] div[role="button"] > div {
+            color: var(--text-primary) !important;
+            font-weight: 500 !important;
+        }
+
+        /* Ensure dropdowns show clean text without duplicates */
+        .stSelectbox > div > div > div {
+            background: rgba(10, 14, 26, 0.6) !important;
+        }
+
+        /* Caption styling improvements */
+        .stApp [data-testid="stCaptionContainer"] {
+            margin-top: 0.35rem !important;
+            font-size: 0.85rem !important;
+            line-height: 1.5 !important;
+            color: var(--text-muted) !important;
+        }
+        /* Enhanced Hero Section with Glassmorphism */
         .app-hero {
             display: grid;
             grid-template-columns: minmax(0, 2.4fr) minmax(0, 1fr);
             gap: 2.5rem;
             padding: 3rem;
-            border-radius: 30px;
-            border: 1px solid #1f2a4d;
-            background: linear-gradient(135deg, rgba(30, 27, 75, 0.95), rgba(15, 23, 42, 0.95));
-            box-shadow: 0 32px 70px rgba(15, 23, 42, 0.6);
-            margin-bottom: 1.75rem;
+            border-radius: 32px;
+            border: 1.5px solid rgba(100, 116, 255, 0.2);
+            background: linear-gradient(
+                135deg,
+                rgba(26, 35, 66, 0.7),
+                rgba(21, 29, 53, 0.85)
+            );
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            box-shadow:
+                0 20px 60px rgba(0, 0, 0, 0.4),
+                0 8px 16px rgba(124, 58, 237, 0.1),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1);
+            margin-bottom: 2rem;
+            position: relative;
+            overflow: hidden;
         }
+
+        .app-hero::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            right: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(
+                circle at center,
+                rgba(0, 217, 255, 0.08) 0%,
+                rgba(124, 58, 237, 0.05) 50%,
+                transparent 70%
+            );
+            animation: heroGlow 10s ease-in-out infinite;
+        }
+
+        @keyframes heroGlow {
+            0%, 100% { transform: translate(0, 0) rotate(0deg); }
+            50% { transform: translate(-10%, 10%) rotate(180deg); }
+        }
+
+        .hero-left {
+            position: relative;
+            z-index: 1;
+        }
+
         .hero-left h1 {
             margin-bottom: 0.75rem;
-            font-size: 2.4rem;
-            font-weight: 700;
+            font-size: 2.6rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #ffffff, var(--accent-primary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            line-height: 1.2;
         }
+
         .hero-pill {
             display: inline-flex;
             align-items: center;
-            gap: 0.4rem;
-            padding: 0.35rem 0.9rem;
+            gap: 0.5rem;
+            padding: 0.5rem 1.2rem;
             border-radius: 999px;
-            background: rgba(37, 214, 238, 0.15);
-            color: #38bdf8;
-            font-weight: 600;
-            font-size: 0.85rem;
-            letter-spacing: 0.05em;
+            background: linear-gradient(135deg, rgba(0, 217, 255, 0.15), rgba(124, 58, 237, 0.15));
+            border: 1px solid rgba(0, 217, 255, 0.3);
+            color: var(--accent-primary);
+            font-weight: 700;
+            font-size: 0.8rem;
+            letter-spacing: 0.08em;
             text-transform: uppercase;
+            box-shadow: 0 4px 12px rgba(0, 217, 255, 0.15);
+            animation: pillPulse 3s ease-in-out infinite;
         }
+
+        @keyframes pillPulse {
+            0%, 100% { box-shadow: 0 4px 12px rgba(0, 217, 255, 0.15); }
+            50% { box-shadow: 0 6px 20px rgba(0, 217, 255, 0.3); }
+        }
+
         .hero-subtitle {
-            font-size: 1.05rem;
-            color: #cbd5f5;
-            margin-top: 0.5rem;
-            margin-bottom: 1.5rem;
+            font-size: 1.08rem;
+            color: var(--text-secondary);
+            margin-top: 1rem;
+            margin-bottom: 1.75rem;
+            line-height: 1.7;
+            font-weight: 400;
         }
+
         .hero-steps {
             display: flex;
             flex-wrap: wrap;
-            gap: 0.75rem;
+            gap: 0.85rem;
         }
+
         .hero-step {
-            background: rgba(37, 99, 235, 0.18);
-            color: #93c5fd;
+            background: linear-gradient(135deg, rgba(0, 217, 255, 0.12), rgba(124, 58, 237, 0.08));
+            border: 1px solid rgba(0, 217, 255, 0.25);
+            color: var(--accent-primary);
             font-weight: 600;
-            border-radius: 12px;
-            padding: 0.55rem 0.9rem;
+            border-radius: 14px;
+            padding: 0.7rem 1.2rem;
+            font-size: 0.92rem;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(10px);
         }
+
+        .hero-step:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(0, 217, 255, 0.2);
+            border-color: var(--accent-primary);
+        }
+
         .hero-highlight {
-            background: #111c3a;
-            border-radius: 24px;
-            border: 1px solid #1f2a4d;
-            padding: 2rem;
+            background: linear-gradient(135deg, rgba(26, 35, 66, 0.9), rgba(21, 29, 53, 0.95));
+            border-radius: 28px;
+            border: 1.5px solid rgba(0, 217, 255, 0.3);
+            padding: 2.5rem;
             display: flex;
             flex-direction: column;
-            gap: 0.9rem;
-            box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.25);
+            gap: 1.2rem;
+            box-shadow:
+                0 8px 32px rgba(0, 0, 0, 0.3),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1),
+                0 0 0 1px rgba(0, 217, 255, 0.1);
+            position: relative;
+            z-index: 1;
+            backdrop-filter: blur(10px);
         }
+
         .hero-metric-label {
             text-transform: uppercase;
             font-size: 0.75rem;
-            letter-spacing: 0.12em;
-            color: #94a3b8;
+            letter-spacing: 0.15em;
+            color: var(--text-muted);
+            font-weight: 600;
         }
+
         .hero-metric-value {
-            font-size: 3.1rem;
-            font-weight: 700;
-            color: #f8fafc;
+            font-size: 3.5rem;
+            font-weight: 800;
+            color: var(--text-primary);
+            line-height: 1;
+            text-shadow: 0 2px 12px rgba(0, 217, 255, 0.3);
         }
+
         .hero-metric-badge {
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            padding: 0.35rem 0.85rem;
+            padding: 0.5rem 1.2rem;
             border-radius: 999px;
-            font-weight: 600;
+            font-weight: 700;
+            font-size: 0.9rem;
+            letter-spacing: 0.02em;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
         }
+
         .hero-highlight-note {
-            font-size: 0.92rem;
-            color: #cbd5f5;
+            font-size: 0.95rem;
+            color: var(--text-secondary);
+            line-height: 1.6;
         }
+        /* Enhanced Risk Badges */
         .risk-badge-low {
-            background: rgba(34, 197, 94, 0.2);
-            color: #4ade80;
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.25), rgba(5, 150, 105, 0.2));
+            border: 1px solid rgba(16, 185, 129, 0.4);
+            color: #6ee7b7;
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2);
         }
+
         .risk-badge-medium {
-            background: rgba(251, 191, 36, 0.25);
-            color: #facc15;
+            background: linear-gradient(135deg, rgba(251, 191, 36, 0.25), rgba(245, 158, 11, 0.2));
+            border: 1px solid rgba(251, 191, 36, 0.4);
+            color: #fcd34d;
+            box-shadow: 0 4px 12px rgba(251, 191, 36, 0.2);
         }
+
         .risk-badge-high {
-            background: rgba(248, 113, 113, 0.25);
-            color: #f87171;
+            background: linear-gradient(135deg, rgba(248, 113, 113, 0.25), rgba(239, 68, 68, 0.2));
+            border: 1px solid rgba(248, 113, 113, 0.4);
+            color: #fca5a5;
+            box-shadow: 0 4px 12px rgba(248, 113, 113, 0.2);
         }
+
         .risk-badge-neutral {
-            background: rgba(59, 130, 246, 0.25);
-            color: #60a5fa;
+            background: linear-gradient(135deg, rgba(0, 217, 255, 0.25), rgba(124, 58, 237, 0.2));
+            border: 1px solid rgba(0, 217, 255, 0.4);
+            color: var(--accent-primary);
+            box-shadow: 0 4px 12px rgba(0, 217, 255, 0.2);
         }
+
+        /* Enhanced Status Cards */
         .status-card {
             display: flex;
-            gap: 0.75rem;
-            background: #111c3a;
-            border-radius: 18px;
-            border: 1px solid #1f2a4d;
-            padding: 1rem 1.2rem;
-            box-shadow: 0 22px 46px rgba(15, 23, 42, 0.45);
+            gap: 1rem;
+            background: linear-gradient(135deg, rgba(26, 35, 66, 0.6), rgba(21, 29, 53, 0.8));
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            border-radius: 20px;
+            border: 1.5px solid rgba(100, 116, 255, 0.2);
+            padding: 1.5rem;
+            box-shadow:
+                0 8px 32px rgba(0, 0, 0, 0.3),
+                0 2px 8px rgba(0, 217, 255, 0.05),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
             height: 100%;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
+
+        .status-card:hover {
+            transform: translateY(-4px);
+            border-color: rgba(0, 217, 255, 0.4);
+            box-shadow:
+                0 12px 40px rgba(0, 0, 0, 0.4),
+                0 4px 16px rgba(0, 217, 255, 0.15),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1);
+        }
+
         .status-icon {
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            min-width: 2.5rem;
-            padding: 0.3rem 0.65rem;
-            border-radius: 999px;
-            background: rgba(59, 130, 246, 0.2);
-            color: #38bdf8;
-            font-size: 0.9rem;
-            font-weight: 700;
+            min-width: 2.8rem;
+            height: 2.8rem;
+            border-radius: 50%;
+            background: linear-gradient(135deg, rgba(0, 217, 255, 0.2), rgba(124, 58, 237, 0.15));
+            border: 1px solid rgba(0, 217, 255, 0.3);
+            color: var(--accent-primary);
+            font-size: 0.85rem;
+            font-weight: 800;
             letter-spacing: 0.08em;
+            box-shadow: 0 4px 12px rgba(0, 217, 255, 0.15);
         }
+
         .status-title {
-            font-weight: 600;
-            color: #f1f5f9;
+            font-weight: 700;
+            color: var(--text-primary);
+            font-size: 1rem;
+            margin-bottom: 0.25rem;
         }
+
         .status-description {
-            font-size: 0.9rem;
-            color: #94a3b8;
-            margin-top: 0.25rem;
+            font-size: 0.88rem;
+            color: var(--text-muted);
+            line-height: 1.5;
         }
+        /* Enhanced Risk Summary Card */
         .risk-summary-card {
             display: flex;
             justify-content: space-between;
-            gap: 1.5rem;
-            background: #111c3a;
-            border-radius: 20px;
-            border: 1px solid #1f2a4d;
-            padding: 1.75rem 2rem;
-            box-shadow: 0 22px 46px rgba(15, 23, 42, 0.45);
-            margin-bottom: 1.5rem;
+            align-items: center;
+            gap: 2rem;
+            background: linear-gradient(135deg, rgba(26, 35, 66, 0.7), rgba(21, 29, 53, 0.9));
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-radius: 24px;
+            border: 1.5px solid rgba(100, 116, 255, 0.25);
+            padding: 2rem 2.5rem;
+            box-shadow:
+                0 12px 48px rgba(0, 0, 0, 0.35),
+                0 4px 12px rgba(0, 217, 255, 0.08),
+                inset 0 1px 0 rgba(255, 255, 255, 0.1);
+            margin-bottom: 1.75rem;
+            position: relative;
+            overflow: hidden;
         }
+
+        .risk-summary-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at top right, rgba(0, 217, 255, 0.05), transparent 60%);
+            pointer-events: none;
+        }
+
         .risk-summary-label {
             text-transform: uppercase;
             font-size: 0.8rem;
-            letter-spacing: 0.12em;
-            color: #94a3b8;
+            letter-spacing: 0.15em;
+            color: var(--text-muted);
+            font-weight: 600;
+            margin-bottom: 0.5rem;
         }
+
         .risk-summary-value {
-            font-size: 2.8rem;
-            font-weight: 700;
-            color: #f8fafc;
+            font-size: 3.2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--text-primary), var(--accent-primary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            line-height: 1;
+            text-shadow: 0 2px 12px rgba(0, 217, 255, 0.2);
         }
+
+        /* Enhanced Insight Items */
         .insight-item {
-            background: #111c3a;
-            border: 1px solid #1f2a4d;
-            border-radius: 16px;
-            padding: 1rem 1.25rem;
-            margin-bottom: 0.75rem;
-            box-shadow: 0 18px 38px rgba(15, 23, 42, 0.4);
-            color: #f1f5f9;
+            background: linear-gradient(135deg, rgba(26, 35, 66, 0.5), rgba(21, 29, 53, 0.7));
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 1.5px solid rgba(100, 116, 255, 0.2);
+            border-radius: 18px;
+            padding: 1.2rem 1.5rem;
+            margin-bottom: 0.85rem;
+            box-shadow:
+                0 4px 16px rgba(0, 0, 0, 0.2),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            color: var(--text-secondary);
             font-weight: 500;
+            font-size: 0.95rem;
+            line-height: 1.6;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
         }
+
+        .insight-item::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 4px;
+            height: 60%;
+            background: linear-gradient(180deg, var(--accent-primary), var(--accent-secondary));
+            border-radius: 0 4px 4px 0;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .insight-item:hover {
+            transform: translateX(4px);
+            border-color: rgba(0, 217, 255, 0.35);
+            box-shadow:
+                0 8px 24px rgba(0, 0, 0, 0.3),
+                0 2px 8px rgba(0, 217, 255, 0.15);
+        }
+
+        .insight-item:hover::before {
+            opacity: 1;
+        }
+
+        /* Enhanced Chat Messages */
         div[data-testid="stChatMessage"] {
-            background: linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(30, 41, 59, 0.95)) !important;
-            border: 1px solid #1f2a4d !important;
-            border-radius: 18px !important;
-            color: #e2e8f0 !important;
-            box-shadow: 0 18px 38px rgba(15, 23, 42, 0.45) !important;
+            background: linear-gradient(135deg, rgba(26, 35, 66, 0.6), rgba(21, 29, 53, 0.8)) !important;
+            backdrop-filter: blur(15px) !important;
+            -webkit-backdrop-filter: blur(15px) !important;
+            border: 1.5px solid rgba(100, 116, 255, 0.2) !important;
+            border-radius: 20px !important;
+            color: var(--text-secondary) !important;
+            box-shadow:
+                0 4px 16px rgba(0, 0, 0, 0.2),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+            padding: 1rem 1.25rem !important;
+            margin-bottom: 0.75rem !important;
         }
+
         div[data-testid="stChatMessage"] * {
-            color: #e2e8f0 !important;
+            color: var(--text-secondary) !important;
         }
+
+        /* Enhanced Chat Input */
         div[data-testid="stChatInput"] textarea {
-            background: #111c3a !important;
-            color: #e2e8f0 !important;
-            border-radius: 16px !important;
-            border: 1px solid #1f2a4d !important;
-            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.5) !important;
+            background: rgba(10, 14, 26, 0.7) !important;
+            backdrop-filter: blur(15px) !important;
+            -webkit-backdrop-filter: blur(15px) !important;
+            color: var(--text-primary) !important;
+            border-radius: 18px !important;
+            border: 1.5px solid rgba(100, 116, 255, 0.25) !important;
+            box-shadow:
+                0 4px 16px rgba(0, 0, 0, 0.2),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05) !important;
+            padding: 1rem !important;
+            font-size: 0.95rem !important;
+            font-weight: 500 !important;
+            transition: all 0.3s ease !important;
         }
+
+        div[data-testid="stChatInput"] textarea:focus {
+            background: rgba(10, 14, 26, 0.9) !important;
+            border-color: var(--accent-primary) !important;
+            box-shadow:
+                0 0 0 3px rgba(0, 217, 255, 0.15),
+                0 6px 24px rgba(0, 217, 255, 0.25),
+                inset 0 1px 0 rgba(255, 255, 255, 0.08) !important;
+        }
+
         div[data-testid="stChatInput"] button {
-            background: linear-gradient(135deg, #38bdf8, #0ea5e9) !important;
-            color: #0b1120 !important;
-            border-radius: 12px !important;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)) !important;
+            color: #ffffff !important;
+            border-radius: 14px !important;
+            border: none !important;
+            padding: 0.6rem 1.2rem !important;
+            font-weight: 600 !important;
+            box-shadow: 0 4px 12px rgba(0, 217, 255, 0.25) !important;
+            transition: all 0.3s ease !important;
         }
+
+        div[data-testid="stChatInput"] button:hover {
+            transform: scale(1.05) !important;
+            box-shadow: 0 6px 20px rgba(0, 217, 255, 0.4) !important;
+        }
+
+        /* Enhanced Assistant Tip */
         .assistant-tip {
-            margin-top: 1rem;
-            background: rgba(15, 23, 42, 0.85);
-            border: 1px dashed rgba(59, 130, 246, 0.6);
-            border-radius: 14px;
-            padding: 0.85rem 1.1rem;
-            color: #cbd5f5;
+            margin-top: 1.25rem;
+            background: linear-gradient(135deg, rgba(26, 35, 66, 0.5), rgba(21, 29, 53, 0.7));
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 1.5px dashed rgba(0, 217, 255, 0.3);
+            border-radius: 16px;
+            padding: 1.2rem 1.5rem;
+            color: var(--text-secondary);
+            box-shadow:
+                0 4px 12px rgba(0, 0, 0, 0.2),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
         }
+
         .assistant-tip ul {
-            margin: 0.35rem 0 0 1.1rem;
+            margin: 0.5rem 0 0 1.5rem;
             padding: 0;
+            color: var(--text-secondary);
+        }
+
+        .assistant-tip ul li {
+            margin-bottom: 0.4rem;
+            line-height: 1.6;
         }
         </style>
         """,
@@ -1244,7 +2167,11 @@ def main():
                                 step=config["step"],
                                 key=f"input_{feature}",
                             )
+                            # Show help text only for number inputs
+                            if config.get("help"):
+                                st.caption(config["help"])
                         else:
+                            # Select/dropdown field
                             options = config["options"]
                             labels = config["labels"]
                             default_value = config.get("default", options[0])
@@ -1254,18 +2181,19 @@ def main():
                                 else 0
                             )
                             label_lookup = dict(zip(options, labels))
+
+                            # Add help text if available (for context, not code mappings)
+                            help_text = config.get("help") if config.get("help") else None
+
                             selected_value = st.selectbox(
                                 label,
                                 options=options,
                                 index=default_index,
                                 format_func=lambda opt, lookup=label_lookup: lookup[opt],
                                 key=f"input_{feature}",
+                                help=help_text
                             )
                             user_inputs[feature] = selected_value
-                        if info_text:
-                            st.caption(info_text)
-                        elif config.get("help"):
-                            st.caption(config["help"])
                 if section_index < len(FORM_SECTIONS) - 1:
                     st.markdown("<hr class='form-section-divider' />", unsafe_allow_html=True)
 
@@ -1381,37 +2309,51 @@ def main():
 
         with assistant_col:
             st.subheader("AI health assistant")
+            context = build_app_context(probability, st.session_state.user_data)
             if gemini_model is None:
                 st.caption(
                     "No Gemini API key detected. Responses are generated locally from the assessment summary."
                 )
 
             if not st.session_state.chatbot_initialized:
+                intro_prompt = (
+                    "Share a concise welcome summary highlighting the user's risk score and the first three actions "
+                    "they should consider this week."
+                )
                 if gemini_model is not None:
                     initial_response = send_message_to_gemini(
                         gemini_model,
-                        [],
-                        st.session_state.system_prompt,
+                        "coach",
+                        st.session_state.agent_histories.get("coach", []),
+                        intro_prompt,
+                        context,
                     )
                 else:
                     initial_response = generate_fallback_response(
                         probability,
                         st.session_state.user_data,
+                        "coach",
                     )
-                st.session_state.chat_history.append(
+                st.session_state.agent_histories["coach"].append(
                     {"role": "assistant", "content": initial_response}
+                )
+                st.session_state.chat_history.append(
+                    {"role": "assistant", "content": initial_response, "agent": "coach"}
                 )
                 st.session_state.chatbot_initialized = True
 
             chat_container = st.container(height=480)
             with chat_container:
                 for message in st.session_state.chat_history:
+                    agent_key = message.get("agent", "coach")
+                    agent_meta = AGENT_DEFINITIONS.get(agent_key, AGENT_DEFINITIONS["coach"])
                     if message["role"] == "user":
                         with st.chat_message("user"):
+                            st.caption(f"Routed to {agent_meta['name']}")
                             st.markdown(message["content"])
                     else:
-                        with st.chat_message("assistant", avatar="\U0001F916"):
-                            st.markdown(message["content"])
+                        with st.chat_message("assistant", avatar=agent_meta.get("avatar", "\U0001F916")):
+                            st.markdown(f"**{agent_meta['name']}**\n\n{message['content']}")
 
             st.markdown(
                 """
@@ -1429,24 +2371,39 @@ def main():
 
             user_message = st.chat_input("Ask about your risk, prevention, or next steps...")
             if user_message:
+                agent_key = determine_agent(user_message)
+                st.session_state.active_agent = agent_key
                 st.session_state.chat_history.append(
-                    {"role": "user", "content": user_message}
+                    {"role": "user", "content": user_message, "agent": agent_key}
                 )
-                if gemini_model is not None:
+                agent_history = st.session_state.agent_histories.setdefault(agent_key, [])
+                agent_history.append({"role": "user", "content": user_message})
+                history_before_user = agent_history[:-1]
+                if agent_key == "scheduler":
+                    assistant_response = process_scheduler_message(
+                        user_message,
+                        probability,
+                        st.session_state.user_data,
+                    )
+                elif gemini_model is not None:
                     with st.spinner("Composing guidance..."):
                         assistant_response = send_message_to_gemini(
                             gemini_model,
-                            st.session_state.chat_history[:-1],
+                            agent_key,
+                            history_before_user,
                             user_message,
+                            context,
                         )
                 else:
                     assistant_response = generate_fallback_response(
                         probability,
                         st.session_state.user_data,
+                        agent_key,
                         user_message,
                     )
+                agent_history.append({"role": "assistant", "content": assistant_response})
                 st.session_state.chat_history.append(
-                    {"role": "assistant", "content": assistant_response}
+                    {"role": "assistant", "content": assistant_response, "agent": agent_key}
                 )
                 st.rerun()
 
