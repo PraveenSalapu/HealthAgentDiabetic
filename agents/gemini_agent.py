@@ -20,13 +20,15 @@ class GeminiAgent(BaseAgent):
     
     def __init__(self):
         """Initialize Gemini agent."""
+        import os
         info = CHAT_MODEL_INFO[CHAT_MODEL_GEMINI]
         super().__init__(
             name=info["name"],
             description=info["description"]
         )
         self.model = None
-        self.api_key = GEMINI_API_KEY
+        # Try to get API key from environment if not in settings
+        self.api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
         self.model_name = GEMINI_MODEL
         self.capabilities = info["capabilities"]
     
@@ -45,6 +47,8 @@ class GeminiAgent(BaseAgent):
             model_name = kwargs.get("model_name", self.model_name)
             
             if not api_key:
+                print("⚠️ Gemini API key not found. Set GEMINI_API_KEY environment variable.")
+                print("   Example: $env:GEMINI_API_KEY='your_key_here'")
                 return False
             
             genai.configure(api_key=api_key)
@@ -52,7 +56,7 @@ class GeminiAgent(BaseAgent):
             self.is_initialized = True
             return True
         except Exception as e:
-            print(f"Error initializing Gemini agent: {e}")
+            print(f"❌ Error initializing Gemini agent: {e}")
             self.is_initialized = False
             return False
     

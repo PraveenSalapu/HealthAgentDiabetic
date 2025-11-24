@@ -148,6 +148,10 @@ def main():
         else:
             st.markdown("## Your Risk Assessment Results")
             
+            # Get risk classification from stored probability
+            from utils.helpers import classify_risk
+            risk_level, badge_class, guidance = classify_risk(st.session_state.prediction_prob)
+            
             # Display risk gauge
             col1, col2 = st.columns([1, 1])
             with col1:

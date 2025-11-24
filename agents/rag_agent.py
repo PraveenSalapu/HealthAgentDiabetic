@@ -35,6 +35,7 @@ class RAGAgent(BaseAgent):
     
     def __init__(self):
         """Initialize RAG agent."""
+        import os
         info = CHAT_MODEL_INFO[CHAT_MODEL_RAG]
         super().__init__(
             name=info["name"],
@@ -43,7 +44,8 @@ class RAGAgent(BaseAgent):
         self.model = None
         self.vectorstore = None
         self.embeddings = None
-        self.api_key = GEMINI_API_KEY
+        # Try to get API key from environment if not in settings
+        self.api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
         self.model_name = GEMINI_MODEL
         self.capabilities = info["capabilities"]
         self.docs_loaded = False
