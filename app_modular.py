@@ -104,27 +104,27 @@ def main():
 
     # Initialize session state
     initialize_session_state()
-    
+
     # Load models
     load_models()
-    
+
     # Sidebar
     st.sidebar.title("🏥 Health AI Chatbot")
     st.sidebar.markdown("### Multi-Agent System")
-    
+
     # Model selector in sidebar
     if st.session_state.agent_manager:
         selected_model = render_model_selector(st.session_state.active_chat_model)
-        
+
         # Switch agent if model changed
         if selected_model != st.session_state.active_chat_model:
             st.session_state.agent_manager.switch_agent(selected_model)
             st.session_state.active_chat_model = selected_model
             st.rerun()
-        
+
         # Show agent status
         render_agent_status(st.session_state.agent_manager)
-    
+
     # Hero Header CSS
     st.markdown("""
     <style>
@@ -671,7 +671,7 @@ Use your clinical knowledge base to give me research-backed guidance specific to
                     with st.spinner("Thinking..."):
                         response = st.session_state.agent_manager.send_message(user_message)
                     st.rerun()
-    
+
     # Footer
     st.markdown("---")
     st.markdown("""
