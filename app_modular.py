@@ -13,13 +13,15 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Modular imports
+import pandas as pd
 from config.settings import (
     MODEL_JSON_PATH,
     PREPROCESSOR_PATH,
     THRESHOLD_PATH,
     AVERAGES_PATH,
     CHAT_MODEL_GEMINI,
-    CHAT_MODEL_RAG,
+    FEATURE_NAMES,
+    CHAT_MODEL_INFO,
 )
 from models import load_model_components, load_diabetic_averages, DiabetesPredictor
 from agents import AgentManager
@@ -31,7 +33,8 @@ from ui.visualizations import (
     create_wellness_radar,
     generate_insights,
 )
-from ui.chat_interface import render_model_selector, render_chat_interface, render_agent_status
+from ui.chat_interface import render_model_selector, render_agent_status
+from utils.helpers import classify_risk, build_profile_summary
 
 
 def initialize_session_state():
@@ -327,7 +330,6 @@ def main():
 
     # Hero Header
     prediction_made = st.session_state.prediction_made
-    from utils.helpers import classify_risk
 
     if prediction_made:
         probability = st.session_state.prediction_prob
@@ -411,14 +413,11 @@ def main():
                 st.rerun()
     else:
         # ============ STEP 2 & 3: ANALYSIS + AI ASSISTANT (Side-by-side) ============
-        from utils.helpers import classify_risk
         risk_level, badge_class, guidance = classify_risk(st.session_state.prediction_prob)
 
         st.success("✅ Assessment complete! Your personalized analysis and AI assistant are ready.")
 
         with st.expander("Review your submitted profile", expanded=False):
-            import pandas as pd
-            from config.settings import FEATURE_NAMES
             summary_df = pd.DataFrame([st.session_state.user_data])
             summary_df.rename(columns=FEATURE_NAMES, inplace=True)
             st.dataframe(summary_df)
@@ -555,7 +554,6 @@ def main():
                 st.markdown("## 🤖 Healthcare AI Agents")
 
                 # Agent selector dropdown (in main area, not just sidebar)
-                from config.settings import CHAT_MODEL_INFO
                 agent_options = st.session_state.agent_manager.get_available_agents()
                 agent_labels = [f"{CHAT_MODEL_INFO[k]['icon']} {CHAT_MODEL_INFO[k]['name']}" for k in agent_options]
 
@@ -582,8 +580,7 @@ def main():
                 st.caption(f"**{agent_info.get('description', '')}**")
 
                 # Build context for agent
-                from utils.helpers import build_profile_summary, classify_risk as classify_risk_util
-                risk_level_current, _, _ = classify_risk_util(st.session_state.prediction_prob)
+                risk_level_current, _, _ = classify_risk(st.session_state.prediction_prob)
                 context = {
                     "probability": st.session_state.prediction_prob,
                     "risk_level": risk_level_current,
