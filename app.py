@@ -125,6 +125,66 @@ FORM_SECTIONS = [
     },
 ]
 
+# Multi-Agent System Definitions
+AGENT_DEFINITIONS = {
+    "coach": {
+        "name": "Health Coach",
+        "avatar": "🧭",
+        "keywords": ["motivation", "routine", "habits", "exercise", "stress", "sleep", "plan"],
+        "system_prompt": (
+            "You are a supportive personal health coach helping someone interpret their diabetes risk results.\n"
+            "Risk probability: {probability:.1f}% ({risk_level}).\n"
+            "Key metrics:\n{profile_summary}\n\n"
+            "Focus on empowering next steps, mindset shifts, and habit coaching. Keep explanations warm and practical."
+        ),
+        "fallback_focus": (
+            "Focus on motivation, small habit changes, and balancing lifestyle pillars like sleep, stress, and movement."
+        ),
+    },
+    "doctor": {
+        "name": "Clinical Advisor",
+        "avatar": "🩺",
+        "keywords": ["symptom", "medication", "diagnosis", "doctor", "treatment", "blood test", "lab"],
+        "system_prompt": (
+            "You are a cautious clinician interpreting model findings without giving direct medical orders.\n"
+            "Risk probability: {probability:.1f}% ({risk_level}).\n"
+            "Key metrics:\n{profile_summary}\n\n"
+            "Highlight questions to raise with a physician, relevant screenings or labs, and safety precautions."
+        ),
+        "fallback_focus": (
+            "Suggest evidence-based checkpoints to review with a doctor and emphasize follow-up care."
+        ),
+    },
+    "dietician": {
+        "name": "Dietician",
+        "avatar": "🥗",
+        "keywords": ["diet", "meal", "food", "nutrition", "carb", "protein", "recipe", "eat"],
+        "system_prompt": (
+            "You are a registered dietician tailoring nutrition advice to the person's risk profile.\n"
+            "Risk probability: {probability:.1f}% ({risk_level}).\n"
+            "Key metrics:\n{profile_summary}\n\n"
+            "Offer practical meal planning, portion guidance, and nutrient strategies aligned with diabetes prevention."
+        ),
+        "fallback_focus": (
+            "Share carbohydrate awareness tips, balanced meals, hydration guidance, and mindful eating strategies."
+        ),
+    },
+    "wellness": {
+        "name": "Wellness Advisor",
+        "avatar": "🌟",
+        "keywords": ["mental", "mindfulness", "meditation", "wellbeing", "balance", "lifestyle"],
+        "system_prompt": (
+            "You are a wellness advisor focusing on holistic health and mental wellbeing.\n"
+            "Risk probability: {probability:.1f}% ({risk_level}).\n"
+            "Key metrics:\n{profile_summary}\n\n"
+            "Provide guidance on stress management, mental health, mindfulness, and overall wellbeing as it relates to diabetes prevention."
+        ),
+        "fallback_focus": (
+            "Guide on stress reduction, mindfulness practices, work-life balance, and mental health support."
+        ),
+    },
+}
+
 # Default averages (fallback if file not found or missing features)
 # Based on BRFSS 2015 diabetic population averages
 DEFAULT_DIABETIC_AVERAGES = {
@@ -258,7 +318,7 @@ def load_diabetic_averages(averages_path: str) -> Dict[str, float]:
 def sanitize_input(value, feature_name: str) -> float:
     """Sanitize and validate user input."""
     config = FEATURE_CONFIGS[feature_name]
-    
+
     if config["type"] == "number":
         try:
             val = float(value)
@@ -267,6 +327,57 @@ def sanitize_input(value, feature_name: str) -> float:
             return config["default"]
     else:  # select
         return int(value) if value in config["options"] else config["options"][0]
+
+def format_feature_value(feature: str, value: float) -> str:
+    """Human readable representation for a feature value."""
+    config = FEATURE_CONFIGS.get(feature, {})
+    if not config:
+        return str(value)
+
+    if config.get("type") == "select":
+        options = config.get("options", [])
+        labels = config.get("labels", [])
+        try:
+            idx = options.index(int(value))
+            return labels[idx]
+        except (ValueError, IndexError):
+            return str(value)
+
+    if feature == "BMI":
+        return f"{value:.1f}"
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return f"{value}"
+
+def build_profile_summary(user_data: Dict[str, float]) -> str:
+    """Create a bullet summary of key user metrics."""
+    lines = []
+    for feature in FEATURE_CONFIGS:
+        if feature not in user_data:
+            continue
+        value = user_data[feature]
+        display = format_feature_value(feature, value)
+        lines.append(f"- {FEATURE_NAMES.get(feature, feature)}: {display}")
+    return "\n".join(lines)
+
+def determine_agent(user_message: str, current_agent: str = "coach") -> str:
+    """Route the user message to the best-fit agent based on keywords."""
+    text = user_message.lower()
+    for key, agent in AGENT_DEFINITIONS.items():
+        for keyword in agent["keywords"]:
+            if keyword in text:
+                return key
+    return current_agent  # Keep current agent if no keyword match
+
+def build_app_context(probability: float, user_data: Dict[str, float]) -> Dict[str, str]:
+    """Assemble common context fields for agents."""
+    risk_level, _, _ = classify_risk(probability)
+    return {
+        "probability": probability,
+        "risk_level": risk_level,
+        "profile_summary": build_profile_summary(user_data),
+    }
 
 def initialize_gemini(api_key: str, model_name: str = "gemini-pro"):
     """Initialize Gemini API."""
@@ -279,8 +390,8 @@ def initialize_gemini(api_key: str, model_name: str = "gemini-pro"):
         return None
 
 def get_system_prompt(prediction_prob: float, user_data: Dict[str, float]) -> str:
-    """Generate system prompt with prediction context."""
-    return f"""You are a compassionate healthcare assistant helping users understand their diabetes risk assessment results. 
+    """Generate system prompt with prediction context - DEPRECATED, use agent-specific prompts."""
+    return f"""You are a compassionate healthcare assistant helping users understand their diabetes risk assessment results.
 
 CONTEXT:
 - The user has completed a diabetes risk assessment
@@ -311,6 +422,74 @@ CONVERSATION STYLE:
 - Keep every response within 200 words unless the user asks for more detail
 
 Begin by providing a gentle, contextual interpretation of their {prediction_prob:.1f}% risk probability and offer to answer any questions."""
+
+def generate_fallback_response(probability: float,
+                               user_data: Dict[str, float],
+                               agent_key: str,
+                               user_message: Optional[str] = None) -> str:
+    """Provide an on-device assistant response when Gemini is unavailable."""
+    agent = AGENT_DEFINITIONS[agent_key]
+    context = build_app_context(probability, user_data)
+    risk_level = context["risk_level"]
+    summary = (
+        f"{agent['name']} (offline mode)\n"
+        f"- Estimated diabetes probability: {probability:.1f}% ({risk_level.lower()} risk)\n"
+        f"- Key health snapshot:\n{context['profile_summary']}"
+    )
+
+    bmi = user_data.get("BMI")
+    phys_activity = user_data.get("PhysActivity")
+    high_bp = user_data.get("HighBP")
+    high_chol = user_data.get("HighChol")
+
+    guidance: List[str] = []
+
+    if agent_key == "coach":
+        if phys_activity == 0:
+            guidance.append("Start with 10-minute movement blocks after meals to wake up insulin sensitivity.")
+        if bmi and bmi >= 30:
+            guidance.append("Set a modest weight trend goal (e.g., 3-5% over 3 months) paired with resistance work.")
+        guidance.append("Use a habit tracker this week: log sleep hours, stress triggers, and screen-time after 9pm.")
+
+    elif agent_key == "doctor":
+        guidance.append("Schedule an A1C or oral glucose tolerance test if it has been more than 12 months.")
+        if high_bp == 1:
+            guidance.append("Bring a log of home blood pressure readings to your next visit.")
+        guidance.append("Ask whether cholesterol, kidney function (eGFR), and retinal screening are due.")
+        guidance.append("Prepare a list of medications and supplements before the appointment.")
+
+    elif agent_key == "dietician":
+        if bmi and bmi >= 28:
+            guidance.append("Build plates with half non-starchy vegetables, quarter lean protein, quarter high-fiber carbs.")
+        guidance.append("Aim for ~25-30g fiber daily from beans, berries, chia, or whole grains.")
+        if high_chol == 1:
+            guidance.append("Swap saturated fats for olive oil, avocado, and nuts to support lipid levels.")
+        guidance.append("Batch-prep breakfast options (e.g., chia pudding, veggie omelets) to prevent morning spikes.")
+
+    elif agent_key == "wellness":
+        guidance.append("Practice daily mindfulness or meditation for 10-15 minutes to reduce stress hormones.")
+        guidance.append("Maintain a consistent sleep schedule; aim for 7-9 hours to support metabolic health.")
+        guidance.append("Consider journaling to track emotional eating patterns and stress triggers.")
+        guidance.append("Explore yoga or tai chi for combined physical and mental benefits.")
+
+    if not guidance:
+        guidance.append(agent["fallback_focus"])
+
+    action_plan = "Key suggestions:\n- " + "\n- ".join(guidance[:4])
+
+    if user_message:
+        return (
+            f"You asked: \"{user_message}\".\n\n"
+            f"{summary}\n\n"
+            f"{action_plan}\n\n"
+            "Always confirm these ideas with a healthcare professional who knows your full history."
+        )
+
+    return (
+        f"{summary}\n\n"
+        f"{action_plan}\n\n"
+        "Let me know if you want to dive deeper into any of these steps."
+    )
 
 # ============================================================================
 # VISUALIZATION FUNCTIONS
@@ -494,29 +673,30 @@ def generate_insights(user_data: Dict[str, float],
 # CHATBOT FUNCTIONS
 # ============================================================================
 
-def send_message_to_gemini(model, chat_history: List[Dict[str, str]], 
-                          user_message: str) -> str:
-    """Send message to Gemini and get response."""
+def send_message_to_gemini(model,
+                          agent_key: str,
+                          conversation: List[Dict[str, str]],
+                          user_message: str,
+                          context: Dict[str, str]) -> str:
+    """Send message to Gemini and get response using agent-specific system prompt."""
     try:
+        agent = AGENT_DEFINITIONS[agent_key]
+        system_prompt = agent["system_prompt"].format(**context)
+
         # Build conversation history
         chat = model.start_chat(history=[])
-        
-        # Send system prompt as first message if this is the start
-        if len(chat_history) == 0:
-            system_msg = st.session_state.get('system_prompt', '')
-            if system_msg:
-                chat.send_message(system_msg)
-        
-        # Send previous messages
-        for msg in chat_history:
-            if msg['role'] == 'user':
-                chat.send_message(msg['content'])
-            # Assistant messages are already in history
-        
+
+        # Send system prompt
+        chat.send_message(system_prompt)
+
+        # Send previous messages for this agent
+        for msg in conversation:
+            chat.send_message(msg['content'])
+
         # Send current message
         response = chat.send_message(user_message)
         return response.text
-    
+
     except Exception as e:
         return f"I apologize, but I encountered an error: {str(e)}. Please try again or rephrase your question."
 
@@ -538,6 +718,12 @@ def initialize_session_state():
         st.session_state.chatbot_initialized = False
     if 'system_prompt' not in st.session_state:
         st.session_state.system_prompt = ""
+    if 'agent_histories' not in st.session_state:
+        st.session_state.agent_histories = {key: [] for key in AGENT_DEFINITIONS}
+    if 'active_agent' not in st.session_state:
+        st.session_state.active_agent = "coach"
+    if 'selected_agent' not in st.session_state:
+        st.session_state.selected_agent = "coach"
 
 def reset_app():
     """Reset application state."""
@@ -547,6 +733,9 @@ def reset_app():
     st.session_state.chat_history = []
     st.session_state.chatbot_initialized = False
     st.session_state.system_prompt = ""
+    st.session_state.agent_histories = {key: [] for key in AGENT_DEFINITIONS}
+    st.session_state.active_agent = "coach"
+    st.session_state.selected_agent = "coach"
 
 def main():
     st.set_page_config(
@@ -897,11 +1086,12 @@ def main():
             on_click=reset_app,
         )
 
-    assessment_tab, insights_tab, assistant_tab = st.tabs(
-        ["Assessment", "Insights", "AI Assistant"]
-    )
+    st.markdown("")
 
-    with assessment_tab:
+    # ============ FLOW-BASED UI: Form → Analysis & Visualizations → AI Assistant ============
+
+    if not prediction_made:
+        # ============ STEP 1: ASSESSMENT FORM ============
         st.subheader("Tell us about yourself")
         st.caption("Complete the sections below. Defaults reflect typical values and can be adjusted.")
 
@@ -979,15 +1169,24 @@ def main():
                     except Exception as error:
                         st.error(f"Prediction failed: {error}")
                         st.info("Check that the model expects these features and is accessible from disk.")
+    else:
+        # ============ STEP 2 & 3: ANALYSIS + AI ASSISTANT (Side-by-side) ============
+        probability = st.session_state.prediction_prob
+        risk_level, badge_class, risk_message = classify_risk(probability)
 
-    with insights_tab:
-        if not st.session_state.prediction_made:
-            st.info("Complete the assessment to unlock tailored risk insights and comparisons.")
-        else:
-            probability = st.session_state.prediction_prob
-            risk_level, badge_class, risk_message = classify_risk(probability)
+        st.success("✅ Assessment complete! Explore your personalized analysis and chat with healthcare AI agents below.")
 
-            st.subheader("Personalized risk summary")
+        with st.expander("📋 Review your submitted profile", expanded=False):
+            summary_df = pd.DataFrame([st.session_state.user_data])
+            summary_df.rename(columns=FEATURE_NAMES, inplace=True)
+            st.dataframe(summary_df)
+
+        # Create two-column layout: Analysis (left) + Chatbot (right)
+        results_col, assistant_col = st.columns([7, 5], gap="large")
+
+        with results_col:
+            # ============ ANALYSIS & VISUALIZATIONS ============
+            st.subheader("📊 Personalized Risk Summary")
             st.markdown(
                 """
                 <div class="risk-summary-card">
@@ -1007,14 +1206,14 @@ def main():
             gauge_fig = create_risk_gauge(probability)
             st.plotly_chart(gauge_fig, use_container_width=True)
 
-            st.markdown("### How you compare")
+            st.markdown("### 📈 How you compare")
             comparison_fig, differences = create_comparison_chart(
                 st.session_state.user_data,
                 diabetic_averages,
             )
             st.plotly_chart(comparison_fig, use_container_width=True)
 
-            st.markdown("### Key takeaways")
+            st.markdown("### 💡 Key takeaways")
             insights = generate_insights(
                 st.session_state.user_data,
                 diabetic_averages,
@@ -1032,42 +1231,77 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-    with assistant_tab:
-        st.subheader("AI health assistant")
-        if not st.session_state.prediction_made:
-            st.info("Run the assessment first so the assistant can ground responses in your results.")
-        elif gemini_model is None:
-            st.warning("Add a GEMINI_API_KEY environment variable to enable the assistant.")
-        else:
+        with assistant_col:
+            # ============ AI HEALTH ASSISTANT WITH MULTI-AGENT SUPPORT ============
+            st.subheader("🤖 Healthcare AI Agents")
+
+            # Agent selector dropdown
+            agent_options = list(AGENT_DEFINITIONS.keys())
+            agent_labels = [f"{AGENT_DEFINITIONS[k]['avatar']} {AGENT_DEFINITIONS[k]['name']}" for k in agent_options]
+
+            selected_agent_index = st.selectbox(
+                "Select Healthcare Agent",
+                options=range(len(agent_options)),
+                format_func=lambda i: agent_labels[i],
+                index=agent_options.index(st.session_state.selected_agent),
+                key="agent_selector"
+            )
+            st.session_state.selected_agent = agent_options[selected_agent_index]
+
+            context = build_app_context(probability, st.session_state.user_data)
+
+            if gemini_model is None:
+                st.caption("⚠️ No Gemini API key detected. Using offline mode with limited responses.")
+
+            # Initialize chatbot automatically with selected agent
             if not st.session_state.chatbot_initialized:
-                initial_response = send_message_to_gemini(
-                    gemini_model,
-                    [],
-                    st.session_state.system_prompt,
+                intro_prompt = (
+                    "Share a concise welcome summary highlighting the user's risk score and the first three actions "
+                    "they should consider this week."
+                )
+                if gemini_model is not None:
+                    initial_response = send_message_to_gemini(
+                        gemini_model,
+                        st.session_state.selected_agent,
+                        st.session_state.agent_histories.get(st.session_state.selected_agent, []),
+                        intro_prompt,
+                        context,
+                    )
+                else:
+                    initial_response = generate_fallback_response(
+                        probability,
+                        st.session_state.user_data,
+                        st.session_state.selected_agent,
+                    )
+                st.session_state.agent_histories[st.session_state.selected_agent].append(
+                    {"role": "assistant", "content": initial_response}
                 )
                 st.session_state.chat_history.append(
-                    {"role": "assistant", "content": initial_response}
+                    {"role": "assistant", "content": initial_response, "agent": st.session_state.selected_agent}
                 )
                 st.session_state.chatbot_initialized = True
 
             chat_container = st.container(height=480)
             with chat_container:
                 for message in st.session_state.chat_history:
+                    agent_key = message.get("agent", "coach")
+                    agent_meta = AGENT_DEFINITIONS.get(agent_key, AGENT_DEFINITIONS["coach"])
                     if message["role"] == "user":
                         with st.chat_message("user"):
+                            st.caption(f"Routed to {agent_meta['name']}")
                             st.markdown(message["content"])
                     else:
-                        with st.chat_message("assistant", avatar="AI"):
-                            st.markdown(message["content"])
+                        with st.chat_message("assistant", avatar=agent_meta.get("avatar", "🤖")):
+                            st.markdown(f"**{agent_meta['name']}**\n\n{message['content']}")
 
             st.markdown(
                 """
                 <div class="assistant-tip">
-                    Try asking:
+                    💬 Try asking:
                     <ul>
-                        <li>What lifestyle changes would have the biggest impact for me?</li>
-                        <li>How should I discuss these results with my doctor?</li>
-                        <li>What labs should I request at my next visit?</li>
+                        <li>What lifestyle changes would have the biggest impact?</li>
+                        <li>What should I discuss with my doctor?</li>
+                        <li>Can you suggest a meal plan?</li>
                     </ul>
                 </div>
                 """,
@@ -1076,17 +1310,37 @@ def main():
 
             user_message = st.chat_input("Ask about your risk, prevention, or next steps...")
             if user_message:
+                # Determine agent: use selected agent by default, but allow keyword routing
+                agent_key = determine_agent(user_message, st.session_state.selected_agent)
+                st.session_state.active_agent = agent_key
+
                 st.session_state.chat_history.append(
-                    {"role": "user", "content": user_message}
+                    {"role": "user", "content": user_message, "agent": agent_key}
                 )
-                with st.spinner("Composing guidance..."):
-                    assistant_response = send_message_to_gemini(
-                        gemini_model,
-                        st.session_state.chat_history[:-1],
+                agent_history = st.session_state.agent_histories.setdefault(agent_key, [])
+                agent_history.append({"role": "user", "content": user_message})
+                history_before_user = agent_history[:-1]
+
+                if gemini_model is not None:
+                    with st.spinner("Composing guidance..."):
+                        assistant_response = send_message_to_gemini(
+                            gemini_model,
+                            agent_key,
+                            history_before_user,
+                            user_message,
+                            context,
+                        )
+                else:
+                    assistant_response = generate_fallback_response(
+                        probability,
+                        st.session_state.user_data,
+                        agent_key,
                         user_message,
                     )
+
+                agent_history.append({"role": "assistant", "content": assistant_response})
                 st.session_state.chat_history.append(
-                    {"role": "assistant", "content": assistant_response}
+                    {"role": "assistant", "content": assistant_response, "agent": agent_key}
                 )
                 st.rerun()
 
